@@ -1,0 +1,37 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+env/
+
+# PyInstaller
+backend/build/
+backend/dist/
+backend/*.spec
+
+# ── Node ──────────────────────────────────────────────────────────────────────
+node_modules/
+dist/
+.next/
+
+# ── Rust / Tauri ──────────────────────────────────────────────────────────────
+src-tauri/target/
+src-tauri/binaries/
+
+# ── Misc ──────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.log
+.env
+.env.local
+
+# ── Decrypted databases (never commit these) ──────────────────────────────────
+*.db
+*.sqlite
+*.db-shm
+*.db-wal
+msgstore*

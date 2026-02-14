@@ -1,0 +1,9 @@
+{
+  "id": "dialog",
+  "permissions": [
+    {
+      "identifier": "dialog:default",
+      "allow": true
+    }
+  ]
+}

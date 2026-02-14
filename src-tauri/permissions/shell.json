@@ -1,0 +1,16 @@
+{
+  "id": "shell",
+  "description": "Allow executing backend sidecar",
+  "permissions": [
+    {
+      "identifier": "shell:allow-execute",
+      "allow": [
+        {
+          "name": "backend",
+          "cmd": "backend",
+          "args": true
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "id": "http",
+  "description": "Allow local backend HTTP",
+  "permissions": [
+    {
+      "identifier": "http:default",
+      "allow": {
+        "scope": ["http://localhost:8765/*"]
+      }
+    }
+  ]
+}

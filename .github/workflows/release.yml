@@ -1,0 +1,121 @@
+name: Build & Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_name:
+        description: "Release name (e.g. v1.0.0)"
+        required: true
+        default: "v1.0.0"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            pyinstaller_args: --noconsole
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            pyinstaller_args: --windowed
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            pyinstaller_args: ""
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      # ── Checkout ────────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Python setup ────────────────────────────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          pip install pyinstaller
+          pip install -r backend/requirements.txt
+
+      # ── Build Python sidecar ─────────────────────────────────────────────────
+      - name: Build Python sidecar
+        working-directory: backend
+        run: |
+          pyinstaller --onefile --name backend ${{ matrix.pyinstaller_args }} \
+            --hidden-import uvicorn.logging \
+            --hidden-import uvicorn.loops.auto \
+            --hidden-import uvicorn.protocols.http.auto \
+            --hidden-import uvicorn.lifespan.on \
+            --hidden-import aiosqlite \
+            --collect-all wa_crypt_tools \
+            --hidden-import Crypto \
+            main.py
+
+      # ── Copy sidecar to Tauri binaries folder ────────────────────────────────
+      - name: Copy sidecar (Windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          New-Item -ItemType Directory -Force -Path "src-tauri/binaries"
+          Copy-Item "backend/dist/backend.exe" "src-tauri/binaries/backend-x86_64-pc-windows-msvc.exe"
+        shell: pwsh
+
+      - name: Copy sidecar (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          mkdir -p src-tauri/binaries
+          cp backend/dist/backend src-tauri/binaries/backend-x86_64-apple-darwin
+
+      - name: Copy sidecar (Linux)
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          mkdir -p src-tauri/binaries
+          cp backend/dist/backend src-tauri/binaries/backend-x86_64-unknown-linux-gnu
+
+      # ── Node.js setup ────────────────────────────────────────────────────────
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install Node dependencies
+        run: npm install
+
+      # ── Rust setup ───────────────────────────────────────────────────────────
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      # ── Linux system dependencies ────────────────────────────────────────────
+      - name: Install Linux dependencies
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      # ── Build Tauri app ───────────────────────────────────────────────────────
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.event.inputs.release_name }}
+          releaseName: "WhatsApp Viewer ${{ github.event.inputs.release_name }}"
+          releaseBody: "Download the installer for your platform below."
+          releaseDraft: false
+          prerelease: false
