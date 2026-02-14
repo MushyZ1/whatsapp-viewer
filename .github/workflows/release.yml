@@ -18,7 +18,7 @@ jobs:
             target: x86_64-pc-windows-msvc
             pyinstaller_args: --noconsole
           - os: macos-latest
-            target: x86_64-apple-darwin
+            target: aarch64-apple-darwin
             pyinstaller_args: --windowed
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
@@ -45,36 +45,20 @@ jobs:
       # ── Build Python sidecar ─────────────────────────────────────────────────
       - name: Build Python sidecar
         working-directory: backend
-        run: |
-          pyinstaller --onefile --name backend ${{ matrix.pyinstaller_args }} \
-            --hidden-import uvicorn.logging \
-            --hidden-import uvicorn.loops.auto \
-            --hidden-import uvicorn.protocols.http.auto \
-            --hidden-import uvicorn.lifespan.on \
-            --hidden-import aiosqlite \
-            --collect-all wa_crypt_tools \
-            --hidden-import Crypto \
-            main.py
+        run: pyinstaller --onefile --name backend ${{ matrix.pyinstaller_args }} --hidden-import uvicorn.logging --hidden-import uvicorn.loops.auto --hidden-import uvicorn.protocols.http.auto --hidden-import uvicorn.lifespan.on --hidden-import aiosqlite --collect-all wa_crypt_tools --hidden-import Crypto main.py
 
       # ── Copy sidecar to Tauri binaries folder ────────────────────────────────
-      - name: Copy sidecar (Windows)
-        if: matrix.os == 'windows-latest'
-        run: |
-          New-Item -ItemType Directory -Force -Path "src-tauri/binaries"
-          Copy-Item "backend/dist/backend.exe" "src-tauri/binaries/backend-x86_64-pc-windows-msvc.exe"
-        shell: pwsh
-
-      - name: Copy sidecar (macOS)
-        if: matrix.os == 'macos-latest'
+      - name: Copy sidecar to Tauri binaries
+        shell: bash
         run: |
           mkdir -p src-tauri/binaries
-          cp backend/dist/backend src-tauri/binaries/backend-x86_64-apple-darwin
-
-      - name: Copy sidecar (Linux)
-        if: matrix.os == 'ubuntu-22.04'
-        run: |
-          mkdir -p src-tauri/binaries
-          cp backend/dist/backend src-tauri/binaries/backend-x86_64-unknown-linux-gnu
+          # On Windows PyInstaller produces .exe, on Unix no extension
+          if [ -f "backend/dist/backend.exe" ]; then
+            cp "backend/dist/backend.exe" "src-tauri/binaries/backend-${{ matrix.target }}.exe"
+          else
+            cp "backend/dist/backend" "src-tauri/binaries/backend-${{ matrix.target }}"
+            chmod +x "src-tauri/binaries/backend-${{ matrix.target }}"
+          fi
 
       # ── Node.js setup ────────────────────────────────────────────────────────
       - name: Set up Node.js
