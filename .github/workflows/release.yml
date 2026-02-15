@@ -33,6 +33,9 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
+      # --------------------
+      # Checkout
+      # --------------------
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -45,13 +48,18 @@ jobs:
           python-version: "3.11"
 
       - name: Install Python dependencies
+        shell: bash
         run: |
-          pip install --upgrade pip
+          python -m pip install --upgrade pip
           pip install pyinstaller
           pip install -r backend/requirements.txt
 
+      # --------------------
+      # Build Python sidecar
+      # --------------------
       - name: Build Python sidecar
         working-directory: backend
+        shell: bash
         run: |
           pyinstaller --onefile \
             --name backend \
@@ -91,6 +99,7 @@ jobs:
           cache: "npm"
 
       - name: Install Node dependencies
+        shell: bash
         run: npm install
 
       # --------------------
