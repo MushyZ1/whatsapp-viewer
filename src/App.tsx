@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import ChatList from "./components/ChatList";
 import MessageList from "./components/MessageList";
@@ -21,6 +21,8 @@ function App() {
   const [isSearching, setIsSearching] = useState(false);
   const [showMediaGallery, setShowMediaGallery] = useState(false);
   const [mediaFolderStatus, setMediaFolderStatus] = useState<string | null>(null);
+  const [exportProgress, setExportProgress] = useState<{ current: number; total: number } | null>(null);
+  const exportAbortRef = useRef<AbortController | null>(null);
   const [debugLog, setDebugLog] = useState<string[]>([]);
   const [showDebugPanel, setShowDebugPanel] = useState(false);
 
@@ -52,9 +54,9 @@ function App() {
       const dbPath = await invoke<string>("select_database");
       addDebug(`Database: ${dbPath}`);
 
-      addDebug("Checking backend...");
-      const ok = await api.checkBackend();
-      if (!ok) throw new Error("Backend not running!\n\nRun: python main.py");
+      addDebug("Waiting for backend...");
+      const ok = await api.waitForBackend(10000);
+      if (!ok) throw new Error("Backend failed to start. Please try again or restart the app.");
 
       addDebug("Initializing...");
       const result = await api.initDatabase(dbPath, undefined);
@@ -210,13 +212,47 @@ function App() {
   };
 
   // ─── EXPORT ─────────────────────────────────────────────────────────────────
-  const handleExportChat = async () => {
+  const handleExportChat = async (includeMedia = false) => {
     if (!selectedChatId) return;
+    // Ask user where to save
+    let exportDir = "";
     try {
-      addDebug(`Exporting chat ${selectedChatId}...`);
-      const savedPath = await api.exportChat(selectedChatId);
-      addDebug(`Saved: ${savedPath}`);
-      alert(`Chat exported!\n\nSaved to:\n${savedPath}`);
+      exportDir = await invoke<string>("select_export_folder");
+    } catch {
+      return; // user cancelled folder picker
+    }
+
+    if (includeMedia) {
+      const abort = new AbortController();
+      exportAbortRef.current = abort;
+      setExportProgress({ current: 0, total: 0 });
+      addDebug(`Exporting chat ${selectedChatId} with media to ${exportDir}...`);
+      await api.exportChatWithMedia(
+        selectedChatId,
+        exportDir,
+        (current, total) => setExportProgress({ current, total }),
+        (result) => {
+          setExportProgress(null);
+          exportAbortRef.current = null;
+          addDebug(`Saved: ${result.saved_to}`);
+          const skipped = result.media_skipped > 0 ? `, ${result.media_skipped} missing/skipped` : "";
+          alert(`Chat + Media exported!\n\nSaved to:\n${result.saved_to}\n\n📁 ${result.media_bundled} files bundled${skipped}.\n\nUnzip and share the .wachat + media/ folder.`);
+        },
+        (msg) => {
+          setExportProgress(null);
+          exportAbortRef.current = null;
+          addDebug(`Export failed: ${msg}`);
+          alert(`Export failed: ${msg}`);
+        },
+        abort.signal,
+      );
+      return;
+    }
+    try {
+      addDebug(`Exporting chat ${selectedChatId} to ${exportDir}...`);
+      const result = await api.exportChat(selectedChatId, exportDir);
+      addDebug(`Saved: ${result.saved_to}`);
+      alert(`Chat exported!\n\nSaved to:\n${result.saved_to}`);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       addDebug(`Export failed: ${msg}`);
@@ -433,8 +469,11 @@ function App() {
                 <button className="action-button" onClick={handleAddMedia} title="Set media folder">
                   ⚙️ Media
                 </button>
-                <button className="action-button" onClick={handleExportChat}>
+                <button className="action-button" onClick={() => handleExportChat(false)} title="Export chat as .wachat file">
                   ⬇️ Export
+                </button>
+                <button className="action-button" onClick={() => handleExportChat(true)} title="Export chat + media files as .zip">
+                  📦 +Media
                 </button>
                 <button
                   className={`action-button ${showDebugPanel ? 'active' : ''}`}
@@ -499,6 +538,52 @@ function App() {
           </div>
         )}
       </div>
+
+      {/* Export progress overlay */}
+      {exportProgress !== null && (
+        <div style={{
+          position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)",
+          display: "flex", alignItems: "center", justifyContent: "center", zIndex: 9999
+        }}>
+          <div style={{
+            background: "#1e2a35", borderRadius: 12, padding: "32px 40px",
+            minWidth: 340, textAlign: "center", boxShadow: "0 8px 32px rgba(0,0,0,0.5)"
+          }}>
+            <div style={{ fontSize: 32, marginBottom: 12 }}>📦</div>
+            <div style={{ color: "#e9edef", fontWeight: 600, fontSize: 16, marginBottom: 8 }}>
+              Exporting media...
+            </div>
+            {exportProgress.total > 0 ? (
+              <>
+                <div style={{ color: "#8696a0", fontSize: 13, marginBottom: 12 }}>
+                  {exportProgress.current} / {exportProgress.total} files
+                </div>
+                <div style={{ background: "#2a3942", borderRadius: 6, height: 8, overflow: "hidden" }}>
+                  <div style={{
+                    background: "#00a884", height: "100%", borderRadius: 6,
+                    width: `${Math.round((exportProgress.current / exportProgress.total) * 100)}%`,
+                    transition: "width 0.2s"
+                  }} />
+                </div>
+                <div style={{ color: "#8696a0", fontSize: 12, marginTop: 8 }}>
+                  {Math.round((exportProgress.current / exportProgress.total) * 100)}%
+                </div>
+              </>
+            ) : (
+              <div style={{ color: "#8696a0", fontSize: 13 }}>Preparing files...</div>
+            )}
+            <button
+              onClick={() => { exportAbortRef.current?.abort(); setExportProgress(null); }}
+              style={{
+                marginTop: 20, background: "transparent", border: "1px solid #8696a0",
+                color: "#8696a0", borderRadius: 6, padding: "6px 20px", cursor: "pointer", fontSize: 13
+              }}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Debug panel */}
       {showDebugPanel && (

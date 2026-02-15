@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 import tempfile
 import subprocess
 import shutil
+import asyncio
 
 from database import DatabaseManager
 from models import Chat, Message, MessagePage, MediaItem, SearchParams
@@ -60,14 +61,16 @@ app = FastAPI(title="WhatsApp Viewer API", version="1.0.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:5173",
-        "http://localhost:1420",
-        "tauri://localhost",
-        "https://tauri.localhost",
+        "http://localhost:5173",    # vite dev
+        "http://localhost:1420",    # tauri dev
+        "http://127.0.0.1:1420",   # tauri dev alt
+        "tauri://localhost",        # tauri v2 WebView2 fallback
+        "https://tauri.localhost",  # tauri v2 secure
+        "http://tauri.localhost",   # tauri v2 Windows production
     ],
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
@@ -592,9 +595,9 @@ async def get_media_gallery(
 
 # ─── EXPORT ───────────────────────────────────────────────────────────────────
 @app.get("/api/chats/{chat_id}/export")
-async def export_chat(chat_id: int, include_media: bool = False):
-    downloads_dir = Path.home() / "Downloads"
-    downloads_dir.mkdir(parents=True, exist_ok=True)
+async def export_chat(chat_id: int, export_dir: str = ""):
+    out_dir = Path(export_dir).expanduser() if export_dir else Path.home() / "Downloads"
+    out_dir.mkdir(parents=True, exist_ok=True)
     try:
         if chat_id == IMPORTED_CHAT_ID and imported_chat_cache is not None:
             export_data = imported_chat_cache
@@ -604,10 +607,10 @@ async def export_chat(chat_id: int, include_media: bool = False):
             raise HTTPException(status_code=400, detail="No data available to export")
 
         filename  = f"chat_{chat_id}_export.wachat"
-        save_path = downloads_dir / filename
+        save_path = out_dir / filename
         counter   = 1
         while save_path.exists():
-            save_path = downloads_dir / f"chat_{chat_id}_export_{counter}.wachat"
+            save_path = out_dir / f"chat_{chat_id}_export_{counter}.wachat"
             counter  += 1
 
         with open(save_path, 'w', encoding='utf-8') as f:
@@ -620,6 +623,101 @@ async def export_chat(chat_id: int, include_media: bool = False):
     except Exception as e:
         logger.error(f"Export failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+# ─── EXPORT WITH MEDIA — STREAMING PROGRESS ──────────────────────────────────
+@app.get("/api/chats/{chat_id}/export-media-stream")
+async def export_chat_with_media_stream(chat_id: int, export_dir: str = ""):
+    import zipfile as _zipfile
+    from fastapi.responses import StreamingResponse as _StreamingResponse
+
+    STORE_EXTS = {
+        '.jpg','.jpeg','.png','.webp','.gif','.heic','.heif',
+        '.mp4','.mov','.avi','.mkv','.webm','.3gp','.m4v',
+        '.mp3','.ogg','.opus','.aac','.m4a','.amr','.weba',
+    }
+
+    async def generate():
+        try:
+            if chat_id == IMPORTED_CHAT_ID and imported_chat_cache is not None:
+                export_data = imported_chat_cache
+            elif db_manager:
+                export_data = await db_manager.export_chat(chat_id)
+            else:
+                err_msg = json.dumps({"type": "error", "message": "No database loaded"})
+                yield f"data: {err_msg}\n\n"
+                return
+
+            active_media_path = None
+            if db_manager and db_manager.media_path:
+                active_media_path = db_manager.media_path
+            elif imported_media_path:
+                active_media_path = imported_media_path
+
+            media_files = []
+            if active_media_path:
+                base = active_media_path.resolve()
+                seen: set = set()
+                for msg in export_data.get("messages", []):
+                    for item in msg.get("media", []):
+                        raw = item.get("file_path") or item.get("media_name") or ""
+                        if not raw or raw in seen:
+                            continue
+                        seen.add(raw)
+                        cleaned  = strip_media_prefix(raw)
+                        abs_path = (active_media_path / cleaned).resolve()
+                        if str(abs_path).startswith(str(base)) and abs_path.is_file():
+                            media_files.append((abs_path, f"media/{cleaned}"))
+
+            total = len(media_files)
+            start_msg = json.dumps({"type": "start", "total": total, "media_available": active_media_path is not None})
+            yield f"data: {start_msg}\n\n"
+
+            out_dir = Path(export_dir).expanduser() if export_dir else Path.home() / "Downloads"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            base_name = f"chat_{chat_id}_export"
+            zip_path  = out_dir / f"{base_name}.zip"
+            counter   = 1
+            while zip_path.exists():
+                zip_path = out_dir / f"{base_name}_{counter}.zip"
+                counter += 1
+
+            skipped = 0
+            zf = _zipfile.ZipFile(zip_path, 'w', _zipfile.ZIP_DEFLATED)
+            try:
+                zf.writestr(f"{base_name}.wachat",
+                            json.dumps(export_data, ensure_ascii=False, indent=2))
+
+                for i, (abs_path, zip_rel) in enumerate(media_files):
+                    try:
+                        ext = abs_path.suffix.lower()
+                        compress = _zipfile.ZIP_STORED if ext in STORE_EXTS else _zipfile.ZIP_DEFLATED
+                        zf.write(abs_path, zip_rel, compress_type=compress)
+                    except Exception as e:
+                        logger.warning(f"Skipping {abs_path}: {e}")
+                        skipped += 1
+
+                    if (i + 1) % 10 == 0 or (i + 1) == total:
+                        prog_msg = json.dumps({"type": "progress", "current": i + 1, "total": total})
+                        yield f"data: {prog_msg}\n\n"
+                        await asyncio.sleep(0)
+            finally:
+                zf.close()
+
+            bundled = total - skipped
+            logger.info(f"Export ZIP: {zip_path} ({bundled} bundled, {skipped} skipped)")
+            done_msg = json.dumps({"type": "done", "saved_to": str(zip_path), "filename": zip_path.name, "media_bundled": bundled, "media_skipped": skipped})
+            yield f"data: {done_msg}\n\n"
+
+        except Exception as e:
+            logger.error(f"Stream export failed: {e}", exc_info=True)
+            err_msg2 = json.dumps({"type": "error", "message": str(e)})
+            yield f"data: {err_msg2}\n\n"
+
+    return _StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 # ─── MEDIA FILES ──────────────────────────────────────────────────────────────
 @app.get("/api/media/{media_path:path}")
@@ -664,16 +762,6 @@ async def health_check():
 # ─── ENTRY ────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
-    import os
-
-    # When frozen by PyInstaller with --noconsole, stdout/stderr are None.
-    # Uvicorn's log formatter calls .isatty() on them and crashes.
-    # Redirect to devnull so it works silently without a console window.
-    if sys.stdout is None:
-        sys.stdout = open(os.devnull, "w")
-    if sys.stderr is None:
-        sys.stderr = open(os.devnull, "w")
-
     port = 8765
     if len(sys.argv) > 2 and sys.argv[1] == "--port":
         try:

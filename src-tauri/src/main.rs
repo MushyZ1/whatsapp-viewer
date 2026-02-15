@@ -1,10 +1,12 @@
-#![cfg_attr(
-    all(not(debug_assertions), target_os = "windows"),
-    windows_subsystem = "windows"
-)]
+// #![cfg_attr(
+//     all(not(debug_assertions), target_os = "windows"),
+//     windows_subsystem = "windows"
+// )]
 
 use std::sync::{Arc, Mutex};
 use std::process::Command as StdCommand;
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 
 use tauri::{Manager, WindowEvent};
 use tauri_plugin_dialog::DialogExt;
@@ -68,6 +70,22 @@ async fn select_media_folder(app: tauri::AppHandle) -> Result<String, String> {
 }
 
 #[tauri::command]
+async fn select_export_folder(app: tauri::AppHandle) -> Result<String, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel::<Option<String>>();
+
+    app.dialog().file().pick_folder(move |folder| {
+        let path_str = folder.map(|f| f.to_string());
+        let _ = tx.send(path_str);
+    });
+
+    match rx.await {
+        Ok(Some(path)) => Ok(path),
+        Ok(None) => Err("No folder selected".into()),
+        Err(_) => Err("Failed to receive folder path".into()),
+    }
+}
+
+#[tauri::command]
 async fn select_chat_import(app: tauri::AppHandle) -> Result<String, String> {
     let (tx, rx) = tokio::sync::oneshot::channel::<Option<String>>();
 
@@ -98,7 +116,7 @@ fn main() {
             #[cfg(target_os = "windows")]
             {
                 let _ = StdCommand::new("cmd")
-                    .args(["/C", "for /f \"tokens=5\" %a in ('netstat -aon ^| findstr :8765') do taskkill /F /PID %a"])
+                    .args(["/C", r#"for /f "tokens=5" %a in ('netstat -aon ^| findstr :8765') do taskkill /F /PID %a"#])
                     .output();
                 
                 // Small delay to ensure port is freed
@@ -139,18 +157,43 @@ fn main() {
         })
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { .. } = event {
+                // Step 1: kill the tracked child process
                 let backend_process = window.state::<BackendProcess>();
                 let mut guard = backend_process.0.lock().unwrap();
                 if let Some(child) = guard.take() {
                     let _ = child.kill();
                 }
                 drop(guard);
+
+                // Step 2: force-kill anything still holding port 8765
+                #[cfg(target_os = "windows")]
+                {
+                    let _ = StdCommand::new("cmd")
+                        .args(["/C", r#"for /f "tokens=5" %a in ('netstat -aon ^| findstr :8765') do taskkill /F /PID %a 2>nul"#])
+                        .creation_flags(0x08000000)
+                        .spawn();
+                }
+
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = StdCommand::new("sh")
+                        .args(["-c", "lsof -ti:8765 | xargs kill -9 2>/dev/null || true"])
+                        .spawn();
+                }
+
+                #[cfg(target_os = "linux")]
+                {
+                    let _ = StdCommand::new("sh")
+                        .args(["-c", "fuser -k 8765/tcp 2>/dev/null || true"])
+                        .spawn();
+                }
             }
         })
         .invoke_handler(tauri::generate_handler![
             select_database,
             select_encrypted_database,
             select_media_folder,
+            select_export_folder,
             select_chat_import
         ])
         .run(tauri::generate_context!())

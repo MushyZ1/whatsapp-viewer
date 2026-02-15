@@ -19,7 +19,9 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "externalBin": ["binaries/backend"]
+    "externalBin": [
+      "binaries/backend"
+    ]
   },
   "app": {
     "windows": [
@@ -40,15 +42,7 @@
   },
   "plugins": {
     "shell": {
-      "open": true,
-      "scope": [
-        {
-          "name": "backend",
-          "cmd": "binaries/backend",
-          "args": ["--port", "8765"],
-          "sidecar": true
-        }
-      ]
+      "open": true
     }
   }
 }

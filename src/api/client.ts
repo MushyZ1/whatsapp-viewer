@@ -1,4 +1,4 @@
-const API_BASE = "http://localhost:8765/api";
+const API_BASE = "http://127.0.0.1:8765/api";
 
 async function fetchWithTimeout(url: string, options: RequestInit = {}, timeout = 10000) {
   const controller = new AbortController();
@@ -57,6 +57,16 @@ export const api = {
     } catch { return false; }
   },
 
+  async waitForBackend(timeoutMs = 10000): Promise<boolean> {
+    const interval = 500;
+    const attempts = timeoutMs / interval;
+    for (let i = 0; i < attempts; i++) {
+      if (await this.checkBackend()) return true;
+      await new Promise(r => setTimeout(r, interval));
+    }
+    return false;
+  },
+
   async checkWadecrypt(): Promise<{ installed: boolean; message: string }> {
     const res = await fetchWithTimeout(`${API_BASE}/check-wadecrypt`);
     if (!res.ok) throw new Error('Failed to check wadecrypt');
@@ -86,8 +96,6 @@ export const api = {
   },
 
   async initDatabase(dbPath: string, mediaPath?: string) {
-    const isRunning = await this.checkBackend();
-    if (!isRunning) throw new Error('Backend not running!\n\nRun: python main.py');
     const res = await fetchWithTimeout(`${API_BASE}/init`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -164,14 +172,48 @@ export const api = {
     return res.json();
   },
 
-  async exportChat(chatId: number): Promise<string> {
-    const res = await fetchWithTimeout(
-      `${API_BASE}/chats/${chatId}/export`,
-      {},
-      60000,
-    );
+  async exportChat(chatId: number, exportDir = ""): Promise<{ saved_to: string; filename: string }> {
+    const url = exportDir
+      ? `${API_BASE}/chats/${chatId}/export?export_dir=${encodeURIComponent(exportDir)}`
+      : `${API_BASE}/chats/${chatId}/export`;
+    const res = await fetchWithTimeout(url, {}, 60000);
     if (!res.ok) throw new Error(`Export failed: ${await res.text()}`);
-    const data = await res.json();
-    return data.saved_to as string;
+    return res.json();
+  },
+
+  async exportChatWithMedia(
+    chatId: number,
+    exportDir: string,
+    onProgress: (current: number, total: number) => void,
+    onDone: (result: { saved_to: string; filename: string; media_bundled: number; media_skipped: number }) => void,
+    onError: (msg: string) => void,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const url = exportDir
+      ? `${API_BASE}/chats/${chatId}/export-media-stream?export_dir=${encodeURIComponent(exportDir)}`
+      : `${API_BASE}/chats/${chatId}/export-media-stream`;
+    const res = await fetch(url, { signal });
+    if (!res.ok) { onError(`Export failed: ${await res.text()}`); return; }
+    const reader = res.body!.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const parts = buffer.split("\n\n");
+      buffer = parts.pop() ?? "";
+      for (const part of parts) {
+        const line = part.trim();
+        if (!line.startsWith("data: ")) continue;
+        try {
+          const evt = JSON.parse(line.slice(6));
+          if (evt.type === "progress") onProgress(evt.current, evt.total);
+          else if (evt.type === "start")  onProgress(0, evt.total);
+          else if (evt.type === "done")   onDone(evt);
+          else if (evt.type === "error")  onError(evt.message);
+        } catch { /* ignore malformed event */ }
+      }
+    }
   },
 };
