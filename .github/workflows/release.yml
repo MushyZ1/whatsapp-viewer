@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       release_name:
-        description: "Release name (e.g. v1.0.0)"
+        description: "Release tag (e.g. v1.0.0)"
         required: true
         default: "v1.0.0"
 
@@ -14,15 +14,21 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Windows
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            pyinstaller_args: --noconsole
-          - os: macos-latest
-            target: universal-apple-darwin  # This covers both Intel and M1/M2/M3
-            pyinstaller_args: --windowed
+
+          # macOS Intel
+          - os: macos-14
+            target: x86_64-apple-darwin
+
+          # macOS Apple Silicon
+          - os: macos-14
+            target: aarch64-apple-darwin
+
+          # Linux
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            pyinstaller_args: ""
 
     runs-on: ${{ matrix.os }}
 
@@ -30,6 +36,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # --------------------
+      # Python Setup
+      # --------------------
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -37,28 +46,44 @@ jobs:
 
       - name: Install Python dependencies
         run: |
+          pip install --upgrade pip
           pip install pyinstaller
           pip install -r backend/requirements.txt
 
-      # ── Build Python sidecar ─────────────────────────────────────────────────
       - name: Build Python sidecar
         working-directory: backend
-        run: pyinstaller --onefile --name backend ${{ matrix.pyinstaller_args }} main.py
+        run: |
+          pyinstaller --onefile \
+            --name backend \
+            --hidden-import uvicorn.logging \
+            --hidden-import uvicorn.loops.auto \
+            --hidden-import uvicorn.protocols.http.auto \
+            --hidden-import uvicorn.lifespan.on \
+            --hidden-import aiosqlite \
+            --collect-all wa_crypt_tools \
+            --hidden-import Crypto \
+            main.py
 
-      - name: Rename, Move, and Sign sidecar
+      # --------------------
+      # Copy sidecar to Tauri
+      # --------------------
+      - name: Copy sidecar to Tauri binaries
         shell: bash
         run: |
           mkdir -p src-tauri/binaries
-          if [ "${{ matrix.os }}" == "windows-latest" ]; then
-            mv "backend/dist/backend.exe" "src-tauri/binaries/backend-${{ matrix.target }}.exe"
+
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            cp backend/dist/backend.exe \
+              src-tauri/binaries/backend-${{ matrix.target }}.exe
           else
-            mv "backend/dist/backend" "src-tauri/binaries/backend-${{ matrix.target }}"
-            # Self-sign the sidecar so macOS doesn't think it's 'damaged'
-            if [ "${{ matrix.os }}" == "macos-latest" ]; then
-              codesign --force --deep --sign - "src-tauri/binaries/backend-${{ matrix.target }}"
-            fi
+            cp backend/dist/backend \
+              src-tauri/binaries/backend-${{ matrix.target }}
+            chmod +x src-tauri/binaries/backend-${{ matrix.target }}
           fi
 
+      # --------------------
+      # Node Setup
+      # --------------------
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
@@ -68,30 +93,39 @@ jobs:
       - name: Install Node dependencies
         run: npm install
 
-      # ── Rust setup ───────────────────────────────────────────────────────────
+      # --------------------
+      # Rust Setup
+      # --------------------
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          # Install both architectures for the universal build
-          targets: ${{ matrix.os == 'macos-latest' && 'x86_64-apple-darwin,aarch64-apple-darwin' || matrix.target }}
+          targets: ${{ matrix.target }}
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: "./src-tauri -> target"
 
+      # --------------------
+      # Linux dependencies
+      # --------------------
       - name: Install Linux dependencies
         if: matrix.os == 'ubuntu-22.04'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf
 
-      # ── Build Tauri app ───────────────────────────────────────────────────────
+      # --------------------
+      # Build Tauri App
+      # --------------------
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Use ad-hoc signing (-) to satisfy Gatekeeper's basic check
           APPLE_SIGNING_IDENTITY: "-"
         with:
           tagName: ${{ github.event.inputs.release_name }}
@@ -99,3 +133,4 @@ jobs:
           releaseBody: "Download the installer for your platform below."
           releaseDraft: false
           prerelease: false
+          args: --target ${{ matrix.target }}
