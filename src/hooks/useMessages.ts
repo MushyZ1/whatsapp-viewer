@@ -10,6 +10,8 @@ export function useMessages(chatId: number | null) {
   const [hasMoreDown, setHasMoreDown] = useState(false);
   const [totalCount, setTotalCount] = useState(0);
   const [highlightedMessageId, setHighlightedMessageId] = useState<number | null>(null);
+  // Bumped once per completed jump so the list scrolls exactly once per jump.
+  const [jumpNonce, setJumpNonce] = useState(0);
 
   useEffect(() => {
     if (!chatId) return;
@@ -17,6 +19,7 @@ export function useMessages(chatId: number | null) {
     const loadInitial = async () => {
       setIsLoading(true);
       try {
+        setHighlightedMessageId(null);
         const page = await api.getMessages(chatId, 100);
         setMessages(page.messages);
         setNextCursor(page.next_cursor);
@@ -33,6 +36,14 @@ export function useMessages(chatId: number | null) {
 
     loadInitial();
   }, [chatId]);
+
+  // Clear the highlight once its pulse animation is over, so later list
+  // changes (e.g. loading more messages while scrolling) can't re-trigger it.
+  useEffect(() => {
+    if (!jumpNonce) return;
+    const t = setTimeout(() => setHighlightedMessageId(null), 2500);
+    return () => clearTimeout(t);
+  }, [jumpNonce]);
 
   const loadMore = useCallback(
     async (direction: "up" | "down") => {
@@ -108,6 +119,7 @@ export function useMessages(chatId: number | null) {
         ).sort((a, b) => a.timestamp - b.timestamp);
 
         setMessages(unique);
+        setJumpNonce(n => n + 1);
         setPrevCursor(beforeBatch.prev_cursor);
         setNextCursor(afterBatch.next_cursor);
         setHasMoreUp(beforeBatch.prev_cursor !== null);
@@ -143,6 +155,7 @@ export function useMessages(chatId: number | null) {
       setHasMoreUp(false); // At the top!
       setHasMoreDown(page.next_cursor !== null);
       
+      setJumpNonce(n => n + 1);
       // Highlight first message
       if (page.messages.length > 0) {
         setHighlightedMessageId(page.messages[0].id);
@@ -177,6 +190,7 @@ export function useMessages(chatId: number | null) {
       setHasMoreUp(page.prev_cursor !== null);
       setHasMoreDown(false); // At the bottom!
       
+      setJumpNonce(n => n + 1);
       // Highlight last message
       if (page.messages.length > 0) {
         setHighlightedMessageId(page.messages[page.messages.length - 1].id);
@@ -202,5 +216,6 @@ export function useMessages(chatId: number | null) {
     jumpToMessage,
     jumpToTop,
     jumpToBottom,
+    jumpNonce,
   };
 }

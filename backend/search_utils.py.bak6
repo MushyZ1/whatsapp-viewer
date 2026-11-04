@@ -1,0 +1,86 @@
+"""
+Shared search-query parsing and matching (used by database mode AND import mode).
+
+Query language
+  * words           meeting bud     -> every word must appear, in any order, and
+                                       each may be partial ("bud" finds "budget")
+  * "quoted text"   "budget plan"   -> must appear exactly, as one phrase
+  * matching is case-insensitive for every language (SQLite LIKE only did A-Z)
+  * line breaks / repeated spaces inside a message count as a single space
+"""
+import re
+from typing import List, NamedTuple
+
+# curly / guillemet quotes (phone keyboards) -> plain "
+_QUOTES = str.maketrans({
+    "\u201c": '"', "\u201d": '"', "\u201e": '"', "\u201f": '"',
+    "\u00ab": '"', "\u00bb": '"',
+})
+
+
+class ParsedQuery(NamedTuple):
+    terms: List[str]     # lower-cased words, each must be contained (partial ok)
+    phrases: List[str]   # lower-cased quoted phrases, each must be contained
+    full: str            # whole query (quotes removed) - used for ranking
+
+
+def fold(text) -> str:
+    """Lower-case (Unicode aware) and collapse all whitespace to single spaces."""
+    if not text:
+        return ""
+    return " ".join(str(text).lower().split())
+
+
+def parse_query(query) -> ParsedQuery:
+    terms: List[str] = []
+    phrases: List[str] = []
+    if not query:
+        return ParsedQuery(terms, phrases, "")
+    q = str(query).translate(_QUOTES)
+    for m in re.finditer(r'"([^"]*)"|(\S+)', q):
+        quoted, word = m.group(1), m.group(2)
+        if quoted is not None:
+            p = fold(quoted)
+            if p:
+                phrases.append(p)
+        else:
+            w = fold(word.strip('"'))
+            if w:
+                terms.append(w)
+    return ParsedQuery(terms, phrases, fold(q.replace('"', " ")))
+
+
+def matches(text, pq: ParsedQuery) -> bool:
+    """True if `text` satisfies every word and every quoted phrase."""
+    f = fold(text)
+    if not f:
+        return False
+    return all(t in f for t in pq.terms) and all(p in f for p in pq.phrases)
+
+
+def score(text, pq: ParsedQuery) -> int:
+    """Higher = better match. Only used for the 'Best match first' ordering."""
+    f = fold(text)
+    if not f:
+        return 0
+    s = 0
+    if pq.full and pq.full in f:
+        s += 4                                   # whole query appears contiguously
+    for item in pq.terms + pq.phrases:
+        esc = re.escape(item)
+        if re.search(r"(?<!\w)" + esc, f):
+            s += 1                               # starts at a word boundary
+            if re.search(r"(?<!\w)" + esc + r"(?!\w)", f):
+                s += 1                           # is a whole word / phrase
+    return s
+
+
+def highlight_terms(query) -> List[str]:
+    """What the UI should highlight (words and phrases, de-duplicated)."""
+    pq = parse_query(query)
+    seen, out = set(), []
+    for item in pq.terms + pq.phrases:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out

@@ -1,7 +1,7 @@
 import { useState } from "react";
 
 interface SearchBarProps {
-  onSearch: (query: string, dateFrom?: string, dateTo?: string) => void;
+  onSearch: (query: string, dateFrom?: string, dateTo?: string, sort?: "time" | "relevance") => void;
   isSearching: boolean;
 }
 
@@ -10,9 +10,10 @@ export default function SearchBar({ onSearch, isSearching }: SearchBarProps) {
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
   const [showFilters, setShowFilters] = useState(false);
+  const [sort, setSort] = useState<"time" | "relevance">("time");
 
   const handleSearch = () => {
-    onSearch(query, dateFrom || undefined, dateTo || undefined);
+    onSearch(query, dateFrom || undefined, dateTo || undefined, sort);
   };
 
   const handleClear = () => {
@@ -34,7 +35,7 @@ export default function SearchBar({ onSearch, isSearching }: SearchBarProps) {
         <input
           type="text"
           className="search-input"
-          placeholder="Search messages..."
+          placeholder="Search messages or file names..."
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           onKeyPress={handleKeyPress}
@@ -69,6 +70,17 @@ export default function SearchBar({ onSearch, isSearching }: SearchBarProps) {
       {showFilters && (
         <div className="search-filters">
           <div className="filter-group">
+            <label>Order:</label>
+            <select
+              value={sort}
+              onChange={(e) => setSort(e.target.value as "time" | "relevance")}
+              className="date-input"
+            >
+              <option value="time">Oldest first</option>
+              <option value="relevance">Best match first</option>
+            </select>
+          </div>
+          <div className="filter-group">
             <label>From:</label>
             <input
               type="date"
@@ -91,7 +103,7 @@ export default function SearchBar({ onSearch, isSearching }: SearchBarProps) {
 
       <div className="search-tips">
         💡 <strong>Search tips:</strong> Type partial words (e.g., "hel" finds "hello"),
-        phrases (e.g., "good morning"), or use date filters
+        several words in any order (e.g., meeting bud), "quoted phrases" for an exact match, file names (e.g., IMG_2024 or invoice.pdf), or date filters
       </div>
     </div>
   );

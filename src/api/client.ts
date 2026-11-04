@@ -151,11 +151,12 @@ export const api = {
     dateTo?: string,
     limit = 100,
     offset = 0,
+    sort: "time" | "relevance" = "time",
   ) {
     const res = await fetchWithTimeout(`${API_BASE}/chats/${chatId}/search`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ query, date_from: dateFrom, date_to: dateTo, limit, offset }),
+      body: JSON.stringify({ query, date_from: dateFrom, date_to: dateTo, limit, offset, sort }),
     });
     if (!res.ok) throw new Error(`Search failed: ${await res.text()}`);
     return res.json();

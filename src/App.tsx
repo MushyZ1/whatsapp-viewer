@@ -6,7 +6,7 @@ import MediaGallery from "./components/MediaGallery";
 import SearchBar from "./components/SearchBar";
 import MessageBubble from "./components/MessageBubble";
 import { useMessages } from "./hooks/useMessages";
-import { api, Message } from "./api/client";
+import { api, Message, Chat } from "./api/client";
 import "./styles/chat.css";
 
 type InitMode = "database" | "import" | "decrypt" | null;
@@ -19,12 +19,20 @@ function App() {
   const [initError, setInitError] = useState<string | null>(null);
   const [searchResults, setSearchResults] = useState<Message[] | null>(null);
   const [isSearching, setIsSearching] = useState(false);
+  const [searchTotal, setSearchTotal] = useState<number | null>(null);
+  const [searchHighlight, setSearchHighlight] = useState<string[]>([]);
+  // message id -> attached files that matched the search (name, location, exists)
+  const [fileMatches, setFileMatches] = useState<Record<string, { name: string; path: string | null; location: string | null; exists: boolean | null }[]>>({});
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
+  const lastSearchRef = useRef<{ query: string; dateFrom?: string; dateTo?: string; sort: "time" | "relevance" } | null>(null);
   const [showMediaGallery, setShowMediaGallery] = useState(false);
   const [mediaFolderStatus, setMediaFolderStatus] = useState<string | null>(null);
   const [exportProgress, setExportProgress] = useState<{ current: number; total: number } | null>(null);
   const exportAbortRef = useRef<AbortController | null>(null);
   const [debugLog, setDebugLog] = useState<string[]>([]);
   const [showDebugPanel, setShowDebugPanel] = useState(false);
+  // id -> display name, filled by ChatList once it has loaded the chats.
+  const [chatNameMap, setChatNameMap] = useState<Record<number, string>>({});
 
   // Decrypt mode states
   const [encryptedDbPath, setEncryptedDbPath] = useState<string>("");
@@ -35,7 +43,14 @@ function App() {
   const {
     messages, isLoading, loadMore, hasMoreUp, hasMoreDown,
     totalCount, highlightedMessageId, jumpToMessage, jumpToTop, jumpToBottom,
+    jumpNonce,
   } = useMessages(selectedChatId);
+
+  const handleChatsLoaded = useCallback((loaded: Chat[]) => {
+    const map: Record<number, string> = {};
+    loaded.forEach(c => { map[c.id] = c.name || `Chat ${c.id}`; });
+    setChatNameMap(map);
+  }, []);
 
   const addDebug = (msg: string) => {
     const ts   = new Date().toLocaleTimeString();
@@ -166,6 +181,9 @@ function App() {
       const result = await api.setMediaPath(mediaPath);
       addDebug(`Media configured: ${JSON.stringify(result)}`);
       setMediaFolderStatus(`configured:${mediaPath}`);
+      // re-run the last search so the file cards show the exact paths right away
+      const last = lastSearchRef.current;
+      if (last && searchResults) { void handleSearch(last.query, last.dateFrom, last.dateTo, last.sort); }
       alert("Media folder configured!");
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -185,15 +203,19 @@ function App() {
   };
 
   // ─── SEARCH ─────────────────────────────────────────────────────────────────
-  const handleSearch = useCallback(async (query: string, dateFrom?: string, dateTo?: string) => {
+  const handleSearch = useCallback(async (query: string, dateFrom?: string, dateTo?: string, sort: "time" | "relevance" = "time") => {
     if (!selectedChatId) return;
     if (!query && !dateFrom && !dateTo) { setSearchResults(null); return; }
     setIsSearching(true);
     try {
       addDebug(`Search: "${query}" from=${dateFrom} to=${dateTo}`);
-      const result = await api.searchMessages(selectedChatId, query || undefined, dateFrom, dateTo);
+      const result = await api.searchMessages(selectedChatId, query || undefined, dateFrom, dateTo, 100, 0, sort);
       addDebug(`Found ${result.messages.length} results`);
       setSearchResults(result.messages);
+      setSearchTotal(typeof result.total_count === "number" ? result.total_count : result.messages.length);
+      setSearchHighlight(Array.isArray(result.highlight) ? result.highlight : []);
+      setFileMatches(result.file_matches && typeof result.file_matches === "object" ? result.file_matches : {});
+      lastSearchRef.current = { query, dateFrom, dateTo, sort };
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Unknown error";
       addDebug(`Search failed: ${msg}`);
@@ -202,6 +224,31 @@ function App() {
       setIsSearching(false);
     }
   }, [selectedChatId]);
+
+  const handleLoadMoreResults = async () => {
+    const last = lastSearchRef.current;
+    if (!selectedChatId || !last || !searchResults || isLoadingMore) return;
+    setIsLoadingMore(true);
+    try {
+      const more = await api.searchMessages(
+        selectedChatId, last.query || undefined, last.dateFrom, last.dateTo,
+        100, searchResults.length, last.sort,
+      );
+      addDebug(`Loaded ${more.messages.length} more results`);
+      setFileMatches(prev => ({ ...prev, ...(more.file_matches || {}) }));
+      setSearchResults(prev => {
+        if (!prev) return prev;
+        const seen = new Set(prev.map(m => m.id));
+        return [...prev, ...more.messages.filter((m: Message) => !seen.has(m.id))];
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Unknown error";
+      addDebug(`Load more failed: ${msg}`);
+      alert(`Could not load more results: ${msg}`);
+    } finally {
+      setIsLoadingMore(false);
+    }
+  };
 
   const handleJumpToMessage = (message: Message) => {
     if (!selectedChatId) return;
@@ -438,7 +485,7 @@ function App() {
   // ─── MAIN APP ────────────────────────────────────────────────────────────────
   return (
     <div className="app-container">
-      <ChatList onChatSelect={handleChatSelect} selectedChatId={selectedChatId} />
+      <ChatList onChatSelect={handleChatSelect} selectedChatId={selectedChatId} onChatsLoaded={handleChatsLoaded} />
 
       <div className="message-area">
         {selectedChatId ? (
@@ -447,10 +494,11 @@ function App() {
             <div className="message-header">
               <div className="message-header-left">
                 <div className="message-header-avatar">
-                  {selectedChatId.toString().charAt(0)}
+                  {(chatNameMap[selectedChatId] ?? String(selectedChatId))
+                    .replace(/^[^\p{L}\p{N}]+/u, "").charAt(0).toUpperCase()}
                 </div>
                 <div className="message-header-info">
-                  <h2>Chat #{selectedChatId}</h2>
+                  <h2>{chatNameMap[selectedChatId] ?? `Chat #${selectedChatId}`}</h2>
                   {!searchResults && !showMediaGallery && (
                     <div className="message-header-sub">{totalCount.toLocaleString()} messages</div>
                   )}
@@ -496,7 +544,7 @@ function App() {
             ) : searchResults ? (
               <div className="search-results">
                 <div className="search-results-header">
-                  <h3>🔍 {searchResults.length} result{searchResults.length !== 1 ? 's' : ''}</h3>
+                  <h3>🔍 {(searchTotal ?? searchResults.length).toLocaleString()} result{(searchTotal ?? searchResults.length) !== 1 ? 's' : ''}{searchTotal !== null && searchTotal > searchResults.length ? ` (showing ${searchResults.length.toLocaleString()})` : ''}</h3>
                   <button className="clear-search-button" onClick={() => setSearchResults(null)}>
                     ✕ Clear
                   </button>
@@ -508,10 +556,45 @@ function App() {
                     {searchResults.map(message => (
                       <div key={message.id} className="search-result-item"
                            onClick={() => handleJumpToMessage(message)}>
-                        <MessageBubble message={message} />
+                        <MessageBubble message={message} highlightTerms={searchHighlight} />
+                        {(fileMatches[String(message.id)] || []).map((f, i) => (
+                          <div
+                            key={i}
+                            style={{ margin: "4px 12px 8px", padding: "6px 10px", borderRadius: 6, border: "1px solid rgba(128,128,128,0.35)", fontSize: "0.8rem", wordBreak: "break-all" }}
+                          >
+                            <div>
+                              <strong>{f.name}</strong>
+                              {" - "}
+                              <span style={{ color: f.exists === true ? "#25a244" : f.exists === false ? "#d64545" : "inherit", opacity: f.exists == null ? 0.7 : 1 }}>
+                                {f.exists === true ? "found in media folder" : f.exists === false ? "not found in media folder" : "media folder not set - click Media at the top"}
+                              </span>
+                            </div>
+                            <div style={{ opacity: 0.8, userSelect: "text" }}>{f.location || f.path}</div>
+                            <button
+                              className="jump-button"
+                              style={{ marginTop: 4 }}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                try { navigator.clipboard?.writeText(f.location || f.path || "")?.catch(() => {}); } catch { /* clipboard unavailable */ }
+                              }}
+                            >
+                              Copy path
+                            </button>
+                          </div>
+                        ))}
                         <button className="jump-button">↩ Jump to message</button>
                       </div>
                     ))}
+                    {searchTotal !== null && searchResults.length < searchTotal && (
+                      <button
+                        className="jump-button"
+                        style={{ margin: "12px auto", display: "block" }}
+                        onClick={handleLoadMoreResults}
+                        disabled={isLoadingMore}
+                      >
+                        {isLoadingMore ? "Loading..." : `Load more (${(searchTotal - searchResults.length).toLocaleString()} remaining)`}
+                      </button>
+                    )}
                   </div>
                 )}
               </div>
@@ -525,6 +608,7 @@ function App() {
                 hasMoreUp={hasMoreUp}
                 hasMoreDown={hasMoreDown}
                 highlightedMessageId={highlightedMessageId}
+                jumpNonce={jumpNonce}
               />
             )}
           </>

@@ -7,6 +7,7 @@ import logging
 import sys
 import json
 from pathlib import Path
+from datetime import timedelta
 from contextlib import asynccontextmanager
 import tempfile
 import subprocess
@@ -14,6 +15,7 @@ import shutil
 import asyncio
 
 from database import DatabaseManager
+from search_utils import parse_query, matches, score, highlight_terms, searchable_text, file_matches, resolve_media_file
 from models import Chat, Message, MessagePage, MediaItem, SearchParams
 from indexer import create_indexes, analyze_database
 
@@ -33,6 +35,13 @@ db_manager: Optional[DatabaseManager] = None
 imported_chat_cache: Optional[dict] = None
 IMPORTED_CHAT_ID = -1
 imported_media_path: Optional[Path] = None
+
+
+def _active_media_root():
+    """The media folder in use, in either mode (None if not set)."""
+    if db_manager and db_manager.media_path:
+        return db_manager.media_path
+    return imported_media_path
 
 # ─── REQUEST MODELS ───────────────────────────────────────────────────────────
 class InitRequest(BaseModel):
@@ -462,8 +471,10 @@ async def search_messages(chat_id: int, params: SearchParams):
         filtered = all_msgs
 
         if params.query:
-            q = params.query.lower()
-            filtered = [m for m in filtered if m.get('text') and q in m['text'].lower()]
+            pq = parse_query(params.query)
+            filtered = [m for m in filtered if matches(searchable_text(m.get('text'), m.get('media')), pq)]
+            if params.sort == "relevance":
+                filtered = sorted(filtered, key=lambda m: (-score(searchable_text(m.get('text'), m.get('media')), pq), -m['timestamp']))
 
         if params.date_from:
             try:
@@ -476,7 +487,7 @@ async def search_messages(chat_id: int, params: SearchParams):
         if params.date_to:
             try:
                 from datetime import datetime
-                ts = int(datetime.fromisoformat(params.date_to).timestamp() * 1000)
+                ts = int((datetime.fromisoformat(params.date_to) + timedelta(days=1)).timestamp() * 1000) - 1
                 filtered = [m for m in filtered if m['timestamp'] <= ts]
             except Exception:
                 pass
@@ -485,7 +496,9 @@ async def search_messages(chat_id: int, params: SearchParams):
         page  = filtered[params.offset: params.offset + params.limit]
         return {"messages": [_imported_msg_to_message(m) for m in page],
                 "total_count": total,
-                "has_more": (params.offset + params.limit) < total}
+                "file_matches": file_matches(params.query, {m['id']: (m.get('media') or []) for m in page}, _active_media_root()),
+                "has_more": (params.offset + params.limit) < total,
+                "highlight": highlight_terms(params.query)}
 
     if not db_manager:
         raise HTTPException(status_code=400, detail="Database not initialized")
@@ -498,7 +511,7 @@ async def search_messages(chat_id: int, params: SearchParams):
     try:
         messages, total_count = await db_manager.search_messages(
             chat_id, params.query, params.date_from, params.date_to,
-            params.limit, params.offset)
+            params.limit, params.offset, params.sort)
         message_ids = [msg['_id'] for msg in messages]
         media_dict  = await db_manager.get_media_for_messages(message_ids)
         quotes_dict = await db_manager.get_quoted_messages(message_ids)
@@ -516,8 +529,10 @@ async def search_messages(chat_id: int, params: SearchParams):
                     for m in media_dict.get(mid, [])
                 ],
             ))
-        return {"messages": result, "total_count": total_count,
-                "has_more": (params.offset + params.limit) < total_count}
+        file_hits = file_matches(params.query, media_dict, _active_media_root())
+        return {"messages": result, "total_count": total_count, "file_matches": file_hits,
+                "has_more": (params.offset + params.limit) < total_count,
+                "highlight": highlight_terms(params.query)}
     except HTTPException:
         raise
     except Exception as e:
@@ -734,11 +749,9 @@ async def get_media_file(media_path: str):
     
     try:
         cleaned   = strip_media_prefix(media_path)
-        requested = (active_media_path / cleaned).resolve()
-        base      = active_media_path.resolve()
-        if not str(requested).startswith(str(base)):
-            raise HTTPException(status_code=403, detail="Access denied")
-        if not requested.exists():
+        # same lookup the search cards use, so 'found' there means it loads here
+        requested = resolve_media_file(active_media_path, media_path)
+        if requested is None:
             raise HTTPException(status_code=404, detail=f"Not found: {cleaned}")
         if not requested.is_file():
             raise HTTPException(status_code=400, detail="Not a file")

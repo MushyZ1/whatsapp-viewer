@@ -1,6 +1,7 @@
 import aiosqlite
 from typing import List, Optional, Tuple, Dict
-from datetime import datetime
+from datetime import datetime, timedelta
+from search_utils import parse_query, matches, score, matches_blob, score_blob
 import logging
 from pathlib import Path
 import json
@@ -52,6 +53,13 @@ class DatabaseManager:
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             
+            try:
+                named = await self._get_chats_with_names(db, limit)
+                if named:
+                    return named
+            except Exception as e:
+                logger.debug(f"Name-aware chat query failed, using fallback: {e}")
+
             queries = [
                 """
                 SELECT c._id as id, 
@@ -91,6 +99,92 @@ class DatabaseManager:
             
             return []
     
+    @staticmethod
+    def _format_chat_name(subject, jid, chat_id) -> str:
+        """Group subject, else phone number from the JID, else 'Chat N'."""
+        subject = (subject or "").strip()
+        if subject:
+            return subject
+        jid = (jid or "").strip()
+        if not jid:
+            return f"Chat {chat_id}"
+        user, _, server = jid.partition("@")
+        user = user.split(":")[0]  # drop device suffix like 1234:5@...
+        if server in ("s.whatsapp.net", "c.us"):
+            return f"+{user}" if user.isdigit() else (user or jid)
+        if server == "g.us":
+            return "Unnamed group"
+        if server == "broadcast":
+            return "Status updates" if user == "status" else "Broadcast list"
+        if server == "newsletter":
+            return "Channel"
+        if server == "lid":
+            return f"Contact {user}"
+        return jid
+
+    async def _chat_name_source(self, db):
+        """Return (join_sql, jid_expr) for this schema, or None if unknown."""
+        cursor = await db.execute("PRAGMA table_info(chat)")
+        chat_cols = [r[1] for r in await cursor.fetchall()]
+        if "jid_row_id" in chat_cols:  # newer schema: chat -> jid table
+            cursor = await db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='jid'"
+            )
+            if await cursor.fetchone():
+                return "LEFT JOIN jid j ON j._id = c.jid_row_id", "j.raw_string"
+        if "key_remote_jid" in chat_cols:  # older schema: jid stored on chat
+            return "", "c.key_remote_jid"
+        return None
+
+    async def _get_chats_with_names(self, db, limit: int) -> List[dict]:
+        source = await self._chat_name_source(db)
+        if not source:
+            return []
+        join_sql, jid_expr = source
+        cursor = await db.execute(
+            f"""
+            SELECT c._id AS id, c.subject AS subject, {jid_expr} AS jid,
+                   COUNT(m._id) AS message_count,
+                   MAX(m.timestamp) AS last_message_time
+            FROM chat c
+            {join_sql}
+            LEFT JOIN message m ON c._id = m.chat_row_id
+            GROUP BY c._id
+            HAVING COUNT(m._id) > 0
+            ORDER BY last_message_time DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        rows = await cursor.fetchall()
+        return [
+            {
+                "id": r["id"],
+                "name": self._format_chat_name(r["subject"], r["jid"], r["id"]),
+                "message_count": r["message_count"],
+                "last_message_time": r["last_message_time"],
+            }
+            for r in rows
+        ]
+
+    async def get_chat_name(self, chat_id: int) -> Optional[str]:
+        """Display name for one chat (None if it can't be determined)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            source = await self._chat_name_source(db)
+            if not source:
+                return None
+            join_sql, jid_expr = source
+            cursor = await db.execute(
+                f"SELECT c.subject AS subject, {jid_expr} AS jid "
+                f"FROM chat c {join_sql} WHERE c._id = ?",
+                (chat_id,),
+            )
+            row = await cursor.fetchone()
+            if not row:
+                return None
+            return self._format_chat_name(row["subject"], row["jid"], chat_id)
+
     async def get_message_count(self, chat_id: int) -> int:
         """Get total message count for pagination"""
         async with aiosqlite.connect(self.db_path) as db:
@@ -259,7 +353,8 @@ class DatabaseManager:
         date_from: Optional[str] = None,
         date_to: Optional[str] = None,
         limit: int = 100,
-        offset: int = 0
+        offset: int = 0,
+        sort: str = "time"
     ) -> Tuple[List[dict], int]:
         """
         Search messages with WhatsApp-style matching:
@@ -275,6 +370,21 @@ class DatabaseManager:
             db.row_factory = aiosqlite.Row
             
             if query:
+                # Words in any order (partial ok) + "quoted phrases", Unicode case-insensitive.
+                # Registered per connection, so each search uses its own query.
+                pq = parse_query(query)
+                # Attachments are searchable by file name / caption too (folder names are
+                # not). Thumbnail-cache rows (NULL mime_type, no extension) are ignored.
+                if self.schema_cache.get('has_message_media'):
+                    media_expr = (
+                        "(SELECT group_concat(COALESCE(mm.media_name,'') || char(31) || COALESCE(mm.file_path,'') || char(31) || COALESCE(mm.media_caption,''), char(30)) "
+                        "FROM message_media mm WHERE mm.message_row_id = message._id "
+                        "AND (mm.mime_type IS NOT NULL OR mm.file_path LIKE '%.%'))"
+                    )
+                else:
+                    media_expr = "NULL"
+                await db.create_function("wa_match", 2, lambda t, b, _pq=pq: 1 if matches_blob(t, b, _pq) else 0)
+                await db.create_function("wa_score", 2, lambda t, b, _pq=pq: score_blob(t, b, _pq))
                 search_pattern = self._prepare_search_query(query)
                 logger.info(f"ðŸ” Search pattern: '{query}' â†’ '{search_pattern}'")
                 
@@ -282,9 +392,9 @@ class DatabaseManager:
                 SELECT _id, timestamp, {from_me_col} as from_me,
                        text_data, message_type
                 FROM message
-                WHERE chat_row_id = ? AND text_data LIKE ? ESCAPE '\\'
+                WHERE chat_row_id = ? AND wa_match(text_data, {media_expr}) = ?
                 """
-                params = [chat_id, search_pattern]
+                params = [chat_id, 1]
             else:
                 base_query = f"""
                 SELECT _id, timestamp, {from_me_col} as from_me,
@@ -304,7 +414,8 @@ class DatabaseManager:
             
             if date_to:
                 try:
-                    date_timestamp = int(datetime.strptime(date_to, '%Y-%m-%d').timestamp() * 1000)
+                    # inclusive: the whole 'To' day counts (was: midnight at the START of it)
+                    date_timestamp = int((datetime.strptime(date_to, '%Y-%m-%d') + timedelta(days=1)).timestamp() * 1000) - 1
                     base_query += " AND timestamp <= ?"
                     params.append(date_timestamp)
                 except ValueError:
@@ -316,7 +427,9 @@ class DatabaseManager:
                     "SELECT COUNT(*)"
                 )
                 
-                cursor = await db.execute(count_query, tuple(params))
+                # (count_query above never matched its own SELECT, so it returned the first
+                # row's _id instead of a count - wrap the real query instead.)
+                cursor = await db.execute("SELECT COUNT(*) FROM (" + base_query + ")", tuple(params))
                 result = await cursor.fetchone()
                 total_count = result[0] if result else 0
                 
@@ -325,7 +438,10 @@ class DatabaseManager:
                 logger.error(f"Count query failed: {e}")
                 total_count = 0
             
-            base_query += " ORDER BY timestamp ASC LIMIT ? OFFSET ?"
+            if query and sort == "relevance":
+                base_query += " ORDER BY wa_score(text_data, " + media_expr + ") DESC, timestamp DESC, _id DESC LIMIT ? OFFSET ?"
+            else:
+                base_query += " ORDER BY timestamp ASC, _id ASC LIMIT ? OFFSET ?"
             params.extend([limit, offset])
             
             try:
@@ -453,6 +569,12 @@ class DatabaseManager:
                     chat_info = await cursor.fetchone()
                 
                 chat_name = dict(chat_info)['name'] if chat_info else f"Chat {chat_id}"
+                try:
+                    resolved_name = await self.get_chat_name(chat_id)
+                    if resolved_name:
+                        chat_name = resolved_name
+                except Exception as e:
+                    logger.debug(f"Could not resolve chat name for export: {e}")
             except Exception as e:
                 logger.error(f"Failed to get chat name: {e}")
                 chat_name = f"Chat {chat_id}"

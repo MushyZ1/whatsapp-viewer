@@ -39,3 +39,4 @@ class SearchParams(BaseModel):
     date_to: Optional[str] = None
     limit: int = 100
     offset: int = 0
+    sort: str = "time"  # "time" = oldest first, "relevance" = best match first

@@ -4,9 +4,10 @@ import { api, Chat } from "../api/client";
 interface ChatListProps {
   onChatSelect: (chatId: number) => void;
   selectedChatId: number | null;
+  onChatsLoaded?: (chats: Chat[]) => void;
 }
 
-export default function ChatList({ onChatSelect, selectedChatId }: ChatListProps) {
+export default function ChatList({ onChatSelect, selectedChatId, onChatsLoaded }: ChatListProps) {
   const [chats, setChats] = useState<Chat[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -22,6 +23,7 @@ export default function ChatList({ onChatSelect, selectedChatId }: ChatListProps
     try {
       const chatList = await api.getChats();
       setChats(chatList);
+      onChatsLoaded?.(chatList);
       console.log(`✅ Loaded ${chatList.length} chats`);
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : "Failed to load chats";
@@ -50,7 +52,11 @@ export default function ChatList({ onChatSelect, selectedChatId }: ChatListProps
   };
 
   const getAvatarLetter = (chat: Chat) => {
-    if (chat.name) return chat.name.charAt(0).toUpperCase();
+    if (chat.name) {
+      // Skip leading symbols such as "+" in phone-number names.
+      const first = chat.name.replace(/^[^\p{L}\p{N}]+/u, "").charAt(0);
+      if (first) return first.toUpperCase();
+    }
     return String(chat.id).charAt(0);
   };
 

@@ -174,6 +174,14 @@ export default function MediaGallery({ chatId }: MediaGalleryProps) {
     return () => { cancelled = true; };  // cleanup: mark as cancelled on unmount/re-run
   }, [chatId, filter]);
 
+  // Esc closes the full-screen viewer
+  useEffect(() => {
+    if (!expanded) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setExpanded(null); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [expanded]);
+
   const markFailed = (id: number) => setFailedIds(prev => new Set([...prev, id]));
 
   const renderItem = (item: MediaItem) => {

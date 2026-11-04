@@ -1,0 +1,192 @@
+"""
+Shared search-query parsing and matching (used by database mode AND import mode).
+
+Query language
+  * words           meeting bud     -> every word must appear, in any order, and
+                                       each may be partial ("bud" finds "budget")
+  * "quoted text"   "budget plan"   -> must appear exactly, as one phrase
+  * matching is case-insensitive for every language (SQLite LIKE only did A-Z)
+  * line breaks / repeated spaces inside a message count as a single space
+"""
+import re
+from typing import List, NamedTuple
+
+# curly / guillemet quotes (phone keyboards) -> plain "
+_QUOTES = str.maketrans({
+    "\u201c": '"', "\u201d": '"', "\u201e": '"', "\u201f": '"',
+    "\u00ab": '"', "\u00bb": '"',
+})
+
+
+class ParsedQuery(NamedTuple):
+    terms: List[str]     # lower-cased words, each must be contained (partial ok)
+    phrases: List[str]   # lower-cased quoted phrases, each must be contained
+    full: str            # whole query (quotes removed) - used for ranking
+
+
+def fold(text) -> str:
+    """Lower-case (Unicode aware) and collapse all whitespace to single spaces."""
+    if not text:
+        return ""
+    return " ".join(str(text).lower().split())
+
+
+def parse_query(query) -> ParsedQuery:
+    terms: List[str] = []
+    phrases: List[str] = []
+    if not query:
+        return ParsedQuery(terms, phrases, "")
+    q = str(query).translate(_QUOTES)
+    for m in re.finditer(r'"([^"]*)"|(\S+)', q):
+        quoted, word = m.group(1), m.group(2)
+        if quoted is not None:
+            p = fold(quoted)
+            if p:
+                phrases.append(p)
+        else:
+            w = fold(word.strip('"'))
+            if w:
+                terms.append(w)
+    return ParsedQuery(terms, phrases, fold(q.replace('"', " ")))
+
+
+def matches(text, pq: ParsedQuery) -> bool:
+    """True if `text` satisfies every word and every quoted phrase."""
+    f = fold(text)
+    if not f:
+        return False
+    return all(t in f for t in pq.terms) and all(p in f for p in pq.phrases)
+
+
+def score(text, pq: ParsedQuery) -> int:
+    """Higher = better match. Only used for the 'Best match first' ordering."""
+    f = fold(text)
+    if not f:
+        return 0
+    s = 0
+    if pq.full and pq.full in f:
+        s += 4                                   # whole query appears contiguously
+    for item in pq.terms + pq.phrases:
+        esc = re.escape(item)
+        if re.search(r"(?<!\w)" + esc, f):
+            s += 1                               # starts at a word boundary
+            if re.search(r"(?<!\w)" + esc + r"(?!\w)", f):
+                s += 1                           # is a whole word / phrase
+    return s
+
+
+def highlight_terms(query) -> List[str]:
+    """What the UI should highlight (words and phrases, de-duplicated)."""
+    pq = parse_query(query)
+    seen, out = set(), []
+    for item in pq.terms + pq.phrases:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# File-name search: attachments are searchable by file name and caption
+# ---------------------------------------------------------------------------
+from pathlib import Path
+
+
+def _basename(path) -> str:
+    return re.split(r"[\\/]", str(path))[-1] if path else ""
+
+
+def is_real_file(mime_type, path) -> bool:
+    """WhatsApp keeps thumbnail-cache rows with a NULL mime_type and extension-less
+    numeric names. Those are not real attachments, so they are ignored."""
+    return bool(mime_type) or "." in _basename(path)
+
+
+def file_text(name, path, caption) -> str:
+    """Searchable text of ONE attachment: its name, the file name on disk and its
+    caption. Folder names are left out on purpose, so searching 'images' does not
+    match every photo."""
+    return " ".join(p for p in (name, _basename(path), caption) if p)
+
+
+def media_text(blob) -> str:
+    """Searchable text of a message's attachments, from the SQL blob built in
+    database.py (records separated by \x1e, fields by \x1f: name, path, caption)."""
+    if not blob:
+        return ""
+    parts = []
+    for rec in str(blob).split("\x1e"):
+        f = rec.split("\x1f")
+        f += [""] * (3 - len(f))
+        parts.append(file_text(f[0], f[1], f[2]))
+    return " ".join(p for p in parts if p)
+
+
+def media_items_text(items) -> str:
+    """Same as media_text() for import mode (a list of attachment dicts)."""
+    parts = []
+    for m in items or []:
+        if is_real_file(m.get("mime_type"), m.get("file_path")):
+            parts.append(file_text(m.get("media_name"), m.get("file_path"),
+                                   m.get("caption") or m.get("media_caption")))
+    return " ".join(p for p in parts if p)
+
+
+def searchable_text(text, media_items) -> str:
+    """Message text plus its attachments' file names/captions (import mode)."""
+    return ((text or "") + " " + media_items_text(media_items)).strip()
+
+
+def matches_blob(text, blob, pq) -> bool:
+    return matches(((text or "") + " " + media_text(blob)).strip(), pq)
+
+
+def score_blob(text, blob, pq) -> int:
+    return score(((text or "") + " " + media_text(blob)).strip(), pq)
+
+
+def file_matches(query, media_by_msg, media_root):
+    """{message_id: [ {name, path, location, exists} ]} for the attachments whose
+    file name or caption contains a search word / phrase.
+    exists: True / False when a media folder is configured, else None (unknown)."""
+    pq = parse_query(query)
+    words = pq.terms + pq.phrases
+    out = {}
+    if not words:
+        return out
+    base = None
+    if media_root:
+        try:
+            base = Path(media_root).resolve()
+        except Exception:
+            base = None
+    for mid, items in (media_by_msg or {}).items():
+        hits = []
+        for m in items or []:
+            path = m.get("file_path")
+            name = m.get("media_name")
+            if not is_real_file(m.get("mime_type"), path):
+                continue
+            f = fold(file_text(name, path, m.get("caption") or m.get("media_caption")))
+            if not any(w in f for w in words):
+                continue
+            location, exists = path, None
+            if path and base is not None:
+                cleaned = path[6:] if path.startswith("Media/") else path
+                try:
+                    full = (base / cleaned).resolve()
+                    if full == base or base in full.parents:   # same guard as the media endpoint
+                        location, exists = str(full), full.is_file()
+                    else:
+                        exists = False
+                except Exception:
+                    exists = None
+            hits.append({
+                "name": _basename(path) or name or "",
+                "path": path,
+                "location": location,
+                "exists": exists,
+            })
+        if hits:
+            out[str(mid)] = hits
+    return out

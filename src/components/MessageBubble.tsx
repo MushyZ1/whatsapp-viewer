@@ -1,8 +1,10 @@
 import { useState, useRef, useEffect, useCallback } from "react";
+import { createPortal } from "react-dom";
 import { Message, api } from "../api/client";
 
 interface MessageBubbleProps {
   message: Message;
+  highlightTerms?: string[];
 }
 
 // ─── WHATSAPP-STYLE AUDIO PLAYER ────────────────────────────────────────────
@@ -170,7 +172,58 @@ function MediaErrorDialog({ media, messageId, mediaUrl, onClose }:
 }
 
 // ─── MAIN BUBBLE ─────────────────────────────────────────────────────────────
-export default function MessageBubble({ message }: MessageBubbleProps) {
+// Wraps matches of the search words in <mark>. Returns the plain text when there
+// is nothing to highlight, so normal chat rendering is unchanged.
+function highlightText(text: string, terms?: string[]): React.ReactNode {
+  if (!terms || terms.length === 0) return text;
+  const parts = terms
+    .map(t => t.trim())
+    .filter(Boolean)
+    .sort((a, b) => b.length - a.length)
+    .map(t => t.split(/\s+/).map(w => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("\\s+"));
+  if (parts.length === 0) return text;
+  let re: RegExp;
+  try {
+    re = new RegExp(`(${parts.join("|")})`, "gi");
+  } catch {
+    return text;
+  }
+  const out: React.ReactNode[] = [];
+  let last = 0;
+  let key = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    if (m[0].length === 0) { re.lastIndex++; continue; }
+    if (m.index > last) out.push(text.slice(last, m.index));
+    out.push(
+      <mark key={key++} style={{ background: "rgba(255, 214, 0, 0.45)", color: "inherit", borderRadius: 2, padding: "0 1px" }}>
+        {m[0]}
+      </mark>
+    );
+    last = m.index + m[0].length;
+  }
+  if (out.length === 0) return text;
+  if (last < text.length) out.push(text.slice(last));
+  return out;
+}
+
+// Draws its children on top of the whole window (outside the transformed, clipped
+// message rows) and closes on Esc. Clicks inside never reach the message/search row.
+function ModalPortal({ onClose, children }: { onClose: () => void; children: React.ReactNode }) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") { e.stopPropagation(); onClose(); }
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [onClose]);
+  return createPortal(
+    <div onClick={e => e.stopPropagation()}>{children}</div>,
+    document.body,
+  );
+}
+
+export default function MessageBubble({ message, highlightTerms }: MessageBubbleProps) {
   const [isMediaVisible, setIsMediaVisible]   = useState(false);
   const [expandedIdx, setExpandedIdx]         = useState<number | null>(null);
   const [errorIdx, setErrorIdx]               = useState<number | null>(null);
@@ -242,18 +295,20 @@ export default function MessageBubble({ message }: MessageBubbleProps) {
             alt={media.media_name || "Image"}
             className="message-image"
             loading="lazy"
-            onClick={() => setExpandedIdx(expanded ? null : idx)}
+            onClick={(e) => { e.stopPropagation(); setExpandedIdx(expanded ? null : idx); }}
             onError={() => markFailed(idx)}
             title="Click to expand"
           />
           {expanded && (
-            <div className="media-modal" onClick={() => setExpandedIdx(null)}>
-              <div className="media-modal-inner" onClick={e => e.stopPropagation()}>
-                <img src={url} alt={media.media_name || "Image"} />
-                {media.caption && <p className="modal-caption">{media.caption}</p>}
+            <ModalPortal onClose={() => setExpandedIdx(null)}>
+              <div className="media-modal" onClick={() => setExpandedIdx(null)}>
+                <div className="media-modal-inner" onClick={e => e.stopPropagation()}>
+                  <img src={url} alt={media.media_name || "Image"} />
+                  {media.caption && <p className="modal-caption">{media.caption}</p>}
+                </div>
+                <button className="close-modal" onClick={() => setExpandedIdx(null)}>✕ Close</button>
               </div>
-              <button className="close-modal" onClick={() => setExpandedIdx(null)}>✕ Close</button>
-            </div>
+            </ModalPortal>
           )}
         </span>
       );
@@ -262,7 +317,7 @@ export default function MessageBubble({ message }: MessageBubbleProps) {
     if (media.mime_type?.startsWith("video/")) {
       return (
         <span key={idx}>
-          <div className="video-thumb-wrapper" onClick={() => setExpandedIdx(expanded ? null : idx)} title="Click to play">
+          <div className="video-thumb-wrapper" onClick={(e) => { e.stopPropagation(); setExpandedIdx(expanded ? null : idx); }} title="Click to play">
             <video className="message-video" preload="metadata"
               onError={() => markFailed(idx)}
             >
@@ -271,15 +326,17 @@ export default function MessageBubble({ message }: MessageBubbleProps) {
             <div className="video-play-overlay">▶</div>
           </div>
           {expanded && (
-            <div className="media-modal" onClick={() => setExpandedIdx(null)}>
-              <div className="media-modal-inner" onClick={e => e.stopPropagation()}>
-                <video controls autoPlay className="modal-video">
-                  <source src={url} type={media.mime_type} />
-                </video>
-                {media.caption && <p className="modal-caption">{media.caption}</p>}
+            <ModalPortal onClose={() => setExpandedIdx(null)}>
+              <div className="media-modal" onClick={() => setExpandedIdx(null)}>
+                <div className="media-modal-inner" onClick={e => e.stopPropagation()}>
+                  <video controls autoPlay className="modal-video">
+                    <source src={url} type={media.mime_type} />
+                  </video>
+                  {media.caption && <p className="modal-caption">{media.caption}</p>}
+                </div>
+                <button className="close-modal" onClick={() => setExpandedIdx(null)}>✕ Close</button>
               </div>
-              <button className="close-modal" onClick={() => setExpandedIdx(null)}>✕ Close</button>
-            </div>
+            </ModalPortal>
           )}
         </span>
       );
@@ -307,7 +364,7 @@ export default function MessageBubble({ message }: MessageBubbleProps) {
             </div>
           )}
 
-          {message.text && <div className="message-text">{message.text}</div>}
+          {message.text && <div className="message-text">{highlightText(message.text, highlightTerms)}</div>}
 
           {message.media.length > 0 && (
             <div className="message-media" ref={mediaRef}>

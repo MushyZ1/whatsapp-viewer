@@ -4,12 +4,14 @@ import react from "@vitejs/plugin-react";
 // https://vitejs.dev/config/
 export default defineConfig({
   plugins: [react()],
-  
+
   // Ensure dev server runs on port 1420 (Tauri default)
   server: {
     port: 1420,
     strictPort: true,
-    host: "localhost",
+    watch: {
+      ignored: ["**/src-tauri/**"],
+    },
   },
 
   // Build configuration
