@@ -518,6 +518,17 @@ body {
   line-height: 1.4;
 }
 
+/* a reply whose original message we can find: click to jump there */
+.quoted-message.quoted-clickable {
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.quoted-message.quoted-clickable:hover { background: rgba(0, 0, 0, 0.32); }
+.quoted-message.quoted-clickable:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
 .message-text {
   line-height: 1.45;
   font-size: 0.9rem;
@@ -2596,3 +2607,167 @@ code {
   word-break: break-word;
   overflow-wrap: break-word;
 }
+
+/* ─── GALLERY <-> CHAT NAVIGATION ─────────────────────────────────────────── */
+/* wrapper around an attachment in a chat bubble; holds the hover 🖼 button */
+.media-with-actions {
+  position: relative;
+  display: inline-block;
+  max-width: 100%;
+  vertical-align: top;
+}
+
+/* 🖼 on a chat attachment ("View in gallery") and 💬 on a gallery tile ("Show in chat") */
+.media-gallery-btn,
+.media-chat-btn {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  z-index: 3;
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.65);
+  color: #fff;
+  font-size: 0.85rem;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s, background 0.15s;
+}
+.media-with-actions:hover .media-gallery-btn,
+.media-item:hover .media-chat-btn,
+.media-gallery-btn:focus-visible,
+.media-chat-btn:focus-visible { opacity: 1; }
+.media-gallery-btn:hover,
+.media-chat-btn:hover { background: var(--accent); }
+
+/* text button next to "✕ Close" in the full-screen viewer */
+.modal-action-btn {
+  position: fixed;
+  top: 16px;
+  right: 120px;
+  z-index: 3001;
+  padding: 8px 18px;
+  border: none;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.12);
+  color: white;
+  font-size: 0.9rem;
+  font-family: var(--font);
+  cursor: pointer;
+  backdrop-filter: blur(6px);
+  transition: background 0.15s;
+}
+.modal-action-btn:hover { background: var(--accent); }
+
+/* tile that was just opened from the chat */
+.media-item.media-item-focus {
+  outline: 3px solid var(--accent);
+  outline-offset: -3px;
+  animation: media-focus-pulse 1.2s ease-out 2;
+}
+@keyframes media-focus-pulse {
+  0%   { box-shadow: 0 0 0 0 rgba(0, 168, 132, 0.7); }
+  100% { box-shadow: 0 0 0 14px rgba(0, 168, 132, 0); }
+}
+
+.gallery-notice {
+  margin: 10px 14px 0;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: rgba(255, 193, 7, 0.12);
+  border: 1px solid rgba(255, 193, 7, 0.3);
+  color: var(--text-primary);
+  font-size: 0.83rem;
+}
+
+/* ─── GALLERY FULL-SCREEN VIEWER (toolbar, prev/next) ─────────────────────── */
+.gallery-viewer-bar {
+  position: fixed;
+  top: 0; left: 0; right: 0;
+  z-index: 3001;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 18px;
+  background: linear-gradient(to bottom, rgba(0, 0, 0, 0.75), rgba(0, 0, 0, 0));
+  cursor: default;
+}
+.gallery-viewer-info { display: flex; flex-direction: column; min-width: 0; }
+.gallery-viewer-title {
+  color: #fff;
+  font-size: 0.95rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.gallery-viewer-sub { color: rgba(255, 255, 255, 0.65); font-size: 0.78rem; }
+.gallery-viewer-actions { display: flex; gap: 10px; flex-shrink: 0; }
+.viewer-btn {
+  padding: 8px 18px;
+  border: none;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.14);
+  color: #fff;
+  font-size: 0.9rem;
+  font-family: var(--font);
+  cursor: pointer;
+  backdrop-filter: blur(6px);
+  transition: background 0.15s;
+}
+.viewer-btn:hover { background: rgba(255, 255, 255, 0.26); }
+.viewer-btn-accent:hover { background: var(--accent); }
+
+.viewer-nav {
+  position: fixed;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 3001;
+  width: 48px;
+  height: 48px;
+  border: none;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.14);
+  color: #fff;
+  font-size: 2rem;
+  line-height: 1;
+  padding-bottom: 4px;
+  cursor: pointer;
+  backdrop-filter: blur(6px);
+  transition: background 0.15s, opacity 0.15s;
+}
+.viewer-nav-prev { left: 18px; }
+.viewer-nav-next { right: 18px; }
+.viewer-nav:hover:not(:disabled) { background: var(--accent); }
+.viewer-nav:disabled { opacity: 0.25; cursor: default; }
+
+/* keep media clear of the toolbar and the side arrows */
+.gallery-viewer-content { max-width: calc(100vw - 150px); }
+.gallery-viewer-content img,
+.gallery-viewer-content .modal-video {
+  max-width: calc(100vw - 150px);
+  max-height: calc(100vh - 150px);
+}
+
+/* ── system / deleted / unsupported notices and stickers ── */
+.message-notice-row { display: flex; justify-content: center; padding: 4px 12px; }
+.message-notice {
+  max-width: 80%; text-align: center; font-size: 12.5px; line-height: 1.4;
+  padding: 5px 12px; border-radius: 8px;
+  background: rgba(128, 128, 128, 0.18); color: var(--text-secondary, #8696a0);
+  word-break: break-word;
+}
+.message-notice-deleted, .message-notice-unsupported { font-style: italic; }
+.message-notice-icon { margin-right: 6px; }
+.message-notice-time { margin-left: 8px; font-size: 11px; opacity: 0.7; white-space: nowrap; }
+.message-bubble-sticker, .message-bubble-sticker.sent, .message-bubble-sticker.received {
+  background: transparent !important; box-shadow: none !important; padding: 2px;
+}
+.message-bubble-sticker::before, .message-bubble-sticker::after { display: none !important; }
+.message-bubble-sticker .message-image { max-width: 160px; max-height: 160px; cursor: default; }

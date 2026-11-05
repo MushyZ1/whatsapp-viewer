@@ -2,11 +2,14 @@ import { useState, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import ChatList from "./components/ChatList";
 import MessageList from "./components/MessageList";
-import MediaGallery from "./components/MediaGallery";
+import MediaGallery, { GalleryFocus } from "./components/MediaGallery";
+import { isStickerMedia } from "./utils/messageKind";
+import MediaViewer, { ViewerItem, viewerItemKey } from "./components/MediaViewer";
 import SearchBar from "./components/SearchBar";
 import MessageBubble from "./components/MessageBubble";
 import { useMessages } from "./hooks/useMessages";
 import { api, Message, Chat } from "./api/client";
+import { getSavedMediaFolder, saveMediaFolder } from "./utils/mediaFolderStore";
 import "./styles/chat.css";
 
 type InitMode = "database" | "import" | "decrypt" | null;
@@ -26,7 +29,16 @@ function App() {
   const [isLoadingMore, setIsLoadingMore] = useState(false);
   const lastSearchRef = useRef<{ query: string; dateFrom?: string; dateTo?: string; sort: "time" | "relevance" } | null>(null);
   const [showMediaGallery, setShowMediaGallery] = useState(false);
+  // attachment the gallery should open when it appears ("View in gallery" from the chat)
+  const [galleryFocus, setGalleryFocus] = useState<GalleryFocus | null>(null);
   const [mediaFolderStatus, setMediaFolderStatus] = useState<string | null>(null);
+  // path of the database / .wachat that is open: the key the media folder is remembered under
+  const sourcePathRef = useRef<string | null>(null);
+  // Full-screen viewer opened from the chat. `items` is what ← / → step through: just the opened
+  // item until the chat's media list has loaded. `startMessageId` is where the user began.
+  const [chatViewer, setChatViewer] = useState<{ item: ViewerItem; items: ViewerItem[]; startMessageId: number } | null>(null);
+  const chatMediaCacheRef = useRef<{ key: string; items: ViewerItem[] } | null>(null);
+  const viewerRequestRef = useRef(0);
   const [exportProgress, setExportProgress] = useState<{ current: number; total: number } | null>(null);
   const exportAbortRef = useRef<AbortController | null>(null);
   const [debugLog, setDebugLog] = useState<string[]>([]);
@@ -42,7 +54,7 @@ function App() {
 
   const {
     messages, isLoading, loadMore, hasMoreUp, hasMoreDown,
-    totalCount, highlightedMessageId, jumpToMessage, jumpToTop, jumpToBottom,
+    totalCount, highlightedMessageId, jumpToMessage, jumpToMessageById, jumpToTop, jumpToBottom,
     jumpNonce,
   } = useMessages(selectedChatId);
 
@@ -57,6 +69,27 @@ function App() {
     const line = `${ts}: ${msg}`;
     console.log(`[DEBUG] ${line}`);
     setDebugLog(prev => [...prev.slice(-100), line]);
+  };
+
+  // ─── REMEMBERED MEDIA FOLDER ────────────────────────────────────────────────
+  // Called right after a database / .wachat is opened. Re-applies the folder the user
+  // picked last time. Never throws: a problem here must not stop the file from opening.
+  const restoreMediaFolder = async (sourcePath: string) => {
+    sourcePathRef.current = sourcePath;
+    chatMediaCacheRef.current = null;   // a new file was opened: drop the cached media list
+    setMediaFolderStatus(null);
+    const saved = getSavedMediaFolder(sourcePath);
+    if (!saved) return;
+    try {
+      await api.setMediaPath(saved);
+      setMediaFolderStatus(`configured:${saved}`);
+      addDebug(`Media folder restored: ${saved}`);
+    } catch (err) {
+      // most likely the folder is gone (e.g. an external drive that isn't plugged in).
+      // The saved path is kept so it works again once the drive is back.
+      setMediaFolderStatus(`missing:${saved}`);
+      addDebug(`Saved media folder not available: ${saved}`);
+    }
   };
 
   // ─── DATABASE INIT ──────────────────────────────────────────────────────────
@@ -77,8 +110,8 @@ function App() {
       const result = await api.initDatabase(dbPath, undefined);
       addDebug(`Done: ${JSON.stringify(result)}`);
 
+      await restoreMediaFolder(dbPath);
       setIsInitialized(true);
-      setMediaFolderStatus(null);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setInitError(msg);
@@ -100,8 +133,8 @@ function App() {
       addDebug("Importing...");
       const result = await api.importChat(chatPath);
       addDebug(`Imported: ${result.chat_name}, ${result.message_count} messages`);
+      await restoreMediaFolder(chatPath);
       setIsInitialized(true);
-      setMediaFolderStatus(null);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       setInitError(msg);
@@ -155,6 +188,7 @@ function App() {
       setTimeout(async () => {
         try {
           await api.initDatabase(result.decrypted_path, undefined);
+          await restoreMediaFolder(result.decrypted_path);
           setIsInitialized(true);
           setInitMode(null);
         } catch (err) {
@@ -181,6 +215,7 @@ function App() {
       const result = await api.setMediaPath(mediaPath);
       addDebug(`Media configured: ${JSON.stringify(result)}`);
       setMediaFolderStatus(`configured:${mediaPath}`);
+      if (sourcePathRef.current) saveMediaFolder(sourcePathRef.current, mediaPath);
       // re-run the last search so the file cards show the exact paths right away
       const last = lastSearchRef.current;
       if (last && searchResults) { void handleSearch(last.query, last.dateFrom, last.dateTo, last.sort); }
@@ -256,6 +291,89 @@ function App() {
     setSearchResults(null);
     setShowMediaGallery(false);
     jumpToMessage(message);
+  };
+
+  // Chat -> gallery: open this attachment in the media gallery.
+  const openInGallery = (messageId: number, filePath: string | null, mediaName: string | null) => {
+    setGalleryFocus({ messageId, filePath, mediaName });
+    setSearchResults(null);
+    setShowMediaGallery(true);
+  };
+
+  const handleViewInGallery = (message: Message, mediaIndex: number) => {
+    const media = message.media[mediaIndex];
+    addDebug(`View in gallery: msg ${message.id} #${mediaIndex}`);
+    openInGallery(message.id, media?.file_path ?? null, media?.media_name ?? null);
+  };
+
+  // ─── CHAT IMAGE / VIDEO VIEWER ────────────────────────────────────────────────
+  // The chat's images and videos, oldest first (so → is the next one in time). Cached per
+  // open file + chat; the list comes from the same endpoint as the gallery.
+  const loadChatMedia = async (chatId: number): Promise<ViewerItem[]> => {
+    const key = `${sourcePathRef.current ?? ""}|${chatId}`;
+    if (chatMediaCacheRef.current?.key === key) return chatMediaCacheRef.current.items;
+    const data = await api.getMediaGallery(chatId, "all");
+    const items: ViewerItem[] = ((data.months || []) as { items: ViewerItem[] }[])
+      .flatMap(g => g.items)
+      .reverse()   // the gallery is newest-first; flip so equal timestamps (several files in one message) stay in attachment order
+      .filter(i => (i.mime_type?.startsWith("image/") || i.mime_type?.startsWith("video/")) && !isStickerMedia(i))
+      .sort((a, b) => a.timestamp - b.timestamp || a.message_id - b.message_id);
+    chatMediaCacheRef.current = { key, items };
+    return items;
+  };
+
+  const handleOpenMedia = (message: Message, mediaIndex: number) => {
+    const media = message.media[mediaIndex];
+    if (!media || !selectedChatId) return;
+    const item: ViewerItem = {
+      message_id: message.id, timestamp: message.timestamp,
+      file_path: media.file_path, media_name: media.media_name,
+      mime_type: media.mime_type, caption: media.caption,
+    };
+    const request = ++viewerRequestRef.current;
+    setChatViewer({ item, items: [item], startMessageId: message.id });   // opens at once
+    loadChatMedia(selectedChatId).then(list => {
+      if (viewerRequestRef.current !== request) return;                    // closed / reopened meanwhile
+      const key = viewerItemKey(item);
+      const items = list.some(i => viewerItemKey(i) === key)
+        ? list
+        : [...list, item].sort((a, b) => a.timestamp - b.timestamp || a.message_id - b.message_id);
+      setChatViewer(v => (v ? { ...v, items } : v));
+    }).catch(err => addDebug(`Could not load the chat's media list: ${err}`));
+  };
+
+  // Closing after stepping to other messages' media: take the chat to where the user ended up.
+  const closeChatViewer = () => {
+    const v = chatViewer;
+    viewerRequestRef.current++;
+    setChatViewer(null);
+    if (v && v.item.message_id !== v.startMessageId && selectedChatId) {
+      addDebug(`Viewer closed on msg ${v.item.message_id}: jumping there`);
+      setSearchResults(null);
+      setShowMediaGallery(false);
+      void jumpToMessageById(v.item.message_id);
+    }
+  };
+
+  const handleGalleryFocusConsumed = useCallback(() => setGalleryFocus(null), []);
+
+  // Reply quote clicked: jump to the message it replies to (also leaves search results / gallery).
+  const handleJumpToQuoted = (messageId: number) => {
+    if (!selectedChatId) return;
+    addDebug(`Jump to quoted msg ${messageId}`);
+    setSearchResults(null);
+    setShowMediaGallery(false);
+    void jumpToMessageById(messageId);
+  };
+
+  // Gallery -> chat: leave the gallery and jump to the attachment's message.
+  const handleShowInChat = (messageId: number) => {
+    if (!selectedChatId) return;
+    addDebug(`Show in chat: msg ${messageId}`);
+    setGalleryFocus(null);
+    setSearchResults(null);
+    setShowMediaGallery(false);
+    void jumpToMessageById(messageId);
   };
 
   // ─── EXPORT ─────────────────────────────────────────────────────────────────
@@ -507,11 +625,15 @@ function App() {
 
               <div className="header-actions">
                 {mediaFolderStatus && (
-                  <div className="media-status" title={mediaFolderStatus}>
+                  <div className="media-status" title={
+                    mediaFolderStatus.startsWith("missing:")
+                      ? `Saved media folder not found: ${mediaFolderStatus.slice(8)} (click ⚙️ Media to pick it again)`
+                      : mediaFolderStatus.replace(/^configured:/, "")
+                  }>
                     Media: {mediaFolderStatus.startsWith("configured:") ? "✅" : "⚙"}
                   </div>
                 )}
-                <button className="action-button" onClick={() => setShowMediaGallery(!showMediaGallery)}>
+                <button className="action-button" onClick={() => { setGalleryFocus(null); setShowMediaGallery(!showMediaGallery); }}>
                   {showMediaGallery ? "💬 Messages" : "🖼 Media"}
                 </button>
                 <button className="action-button" onClick={handleAddMedia} title="Set media folder">
@@ -540,7 +662,12 @@ function App() {
 
             {/* Content area */}
             {showMediaGallery ? (
-              <MediaGallery chatId={selectedChatId} />
+              <MediaGallery
+                chatId={selectedChatId}
+                focus={galleryFocus}
+                onFocusConsumed={handleGalleryFocusConsumed}
+                onShowInChat={handleShowInChat}
+              />
             ) : searchResults ? (
               <div className="search-results">
                 <div className="search-results-header">
@@ -556,7 +683,7 @@ function App() {
                     {searchResults.map(message => (
                       <div key={message.id} className="search-result-item"
                            onClick={() => handleJumpToMessage(message)}>
-                        <MessageBubble message={message} highlightTerms={searchHighlight} />
+                        <MessageBubble message={message} highlightTerms={searchHighlight} onViewInGallery={handleViewInGallery} onOpenMedia={handleOpenMedia} onJumpToQuoted={handleJumpToQuoted} />
                         {(fileMatches[String(message.id)] || []).map((f, i) => (
                           <div
                             key={i}
@@ -609,6 +736,9 @@ function App() {
                 hasMoreDown={hasMoreDown}
                 highlightedMessageId={highlightedMessageId}
                 jumpNonce={jumpNonce}
+                onViewInGallery={handleViewInGallery}
+                onOpenMedia={handleOpenMedia}
+                onJumpToQuoted={handleJumpToQuoted}
               />
             )}
           </>
@@ -667,6 +797,25 @@ function App() {
             </button>
           </div>
         </div>
+      )}
+
+      {/* Full-screen viewer for images / videos opened from the chat */}
+      {chatViewer && (
+        <MediaViewer
+          item={chatViewer.item}
+          items={chatViewer.items}
+          onNavigate={item => setChatViewer(v => (v ? { ...v, item } : v))}
+          onClose={closeChatViewer}
+          actions={[{
+            label: "🖼 View in gallery",
+            onClick: item => {
+              addDebug(`View in gallery: msg ${item.message_id}`);
+              viewerRequestRef.current++;
+              setChatViewer(null);
+              openInGallery(item.message_id, item.file_path, item.media_name);
+            },
+          }]}
+        />
       )}
 
       {/* Debug panel */}

@@ -1,8 +1,22 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useMemo } from "react";
 import { api } from "../api/client";
+import MediaViewer from "./MediaViewer";
+
+// Set by the chat's "View in gallery" button: which attachment to open.
+export interface GalleryFocus {
+  messageId: number;
+  filePath: string | null;
+  mediaName: string | null;
+}
 
 interface MediaGalleryProps {
   chatId: number;
+  /** Open this attachment as soon as the gallery has loaded. */
+  focus?: GalleryFocus | null;
+  /** Called once the focus request has been handled (found or not). */
+  onFocusConsumed?: () => void;
+  /** "Show in chat": leave the gallery and jump to the item's message. */
+  onShowInChat?: (messageId: number) => void;
 }
 
 interface MediaItem {
@@ -13,6 +27,10 @@ interface MediaItem {
   caption: string | null;
   timestamp: number;
 }
+
+// One message can have several attachments, so the message id alone isn't unique.
+const itemKey = (item: MediaItem) =>
+  `${item.message_id}|${item.file_path || item.media_name || ""}`;
 
 interface MonthGroup {
   month: string;
@@ -139,13 +157,18 @@ function GalleryAudioPlayer({ item }: { item: MediaItem }) {
 }
 
 // ─── MAIN COMPONENT ───────────────────────────────────────────────────────────
-export default function MediaGallery({ chatId }: MediaGalleryProps) {
+export default function MediaGallery({ chatId, focus, onFocusConsumed, onShowInChat }: MediaGalleryProps) {
   const [filter, setFilter]       = useState<"all" | "images" | "videos" | "audios">("all");
   const [mediaData, setMediaData] = useState<MonthGroup[]>([]);
+  // which chat + filter `mediaData` belongs to (it is stale while a reload is starting)
+  const [loadedKey, setLoadedKey] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError]         = useState<string | null>(null);
   const [expanded, setExpanded]   = useState<MediaItem | null>(null);
-  const [failedIds, setFailedIds] = useState<Set<number>>(new Set());
+  const [failedIds, setFailedIds] = useState<Set<string>>(new Set());
+  const [focusedKey, setFocusedKey] = useState<string | null>(null);
+  const [notice, setNotice]         = useState<string | null>(null);
+  const galleryRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     // ── FIX: cancelled flag prevents setState after unmount,
@@ -162,6 +185,7 @@ export default function MediaGallery({ chatId }: MediaGalleryProps) {
         const result = await api.getMediaGallery(chatId, filter);
         if (cancelled) return;  // component unmounted — don't touch state
         setMediaData(result.months || []);
+        setLoadedKey(`${chatId}:${filter}`);
       } catch (err) {
         if (cancelled) return;
         setError(err instanceof Error ? err.message : "Failed to load media");
@@ -174,36 +198,104 @@ export default function MediaGallery({ chatId }: MediaGalleryProps) {
     return () => { cancelled = true; };  // cleanup: mark as cancelled on unmount/re-run
   }, [chatId, filter]);
 
-  // Esc closes the full-screen viewer
-  useEffect(() => {
-    if (!expanded) return;
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setExpanded(null); };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [expanded]);
+  // Items the viewer can step through, in the order the grid shows them
+  // (tiles that failed to load are skipped).
+  const navItems = useMemo(
+    () => mediaData.flatMap(g => g.items).filter(i => !failedIds.has(itemKey(i))),
+    [mediaData, failedIds],
+  );
+  // open another item in the viewer and keep its tile in view behind it
+  const openNeighbor = (item: MediaItem) => {
+    setExpanded(item);
+    const key = itemKey(item);
+    requestAnimationFrame(() => {
+      galleryRef.current?.querySelectorAll<HTMLElement>("[data-media-key]")
+        .forEach(t => { if (t.dataset.mediaKey === key) t.scrollIntoView({ block: "center" }); });
+    });
+  };
 
-  const markFailed = (id: number) => setFailedIds(prev => new Set([...prev, id]));
+  // ── Open an attachment requested from the chat ("View in gallery") ───────────
+  // Waits for the "all" list of THIS chat to be loaded (switching the filter to
+  // "all" first if needed), then opens the item and scrolls its tile into view.
+  useEffect(() => {
+    if (!focus) return;
+    if (filter !== "all") { setFilter("all"); return; }
+    if (loadedKey !== `${chatId}:all`) return;
+
+    const candidates = mediaData.flatMap(g => g.items).filter(i => i.message_id === focus.messageId);
+    const item =
+      candidates.find(i => !!focus.filePath && i.file_path === focus.filePath) ??
+      candidates.find(i => !!focus.mediaName && i.media_name === focus.mediaName) ??
+      candidates[0];
+
+    if (!item) {
+      setNotice("That attachment isn't in the gallery (only images, videos and audio are listed).");
+      onFocusConsumed?.();
+      return;
+    }
+
+    const key = itemKey(item);
+    setFocusedKey(key);
+    setExpanded(item);
+    // after the tiles are rendered, bring the tile into view behind the viewer
+    requestAnimationFrame(() => {
+      const tiles = galleryRef.current?.querySelectorAll<HTMLElement>("[data-media-key]");
+      tiles?.forEach(t => { if (t.dataset.mediaKey === key) t.scrollIntoView({ block: "center" }); });
+    });
+    onFocusConsumed?.();
+  }, [focus, filter, loadedKey, mediaData, chatId, onFocusConsumed]);
+
+  // the highlight ring and the notice fade out by themselves
+  useEffect(() => {
+    if (!focusedKey) return;
+    const t = setTimeout(() => setFocusedKey(null), 3000);
+    return () => clearTimeout(t);
+  }, [focusedKey]);
+  useEffect(() => {
+    if (!notice) return;
+    const t = setTimeout(() => setNotice(null), 5000);
+    return () => clearTimeout(t);
+  }, [notice]);
+
+  const markFailed = (key: string) => setFailedIds(prev => new Set([...prev, key]));
+
+  const showInChat = (item: MediaItem) => {
+    setExpanded(null);
+    onShowInChat?.(item.message_id);
+  };
+
+  // small 💬 button on a tile (visible on hover)
+  const chatButton = (item: MediaItem) => onShowInChat && (
+    <button
+      className="media-chat-btn"
+      title="Show in chat"
+      onClick={e => { e.stopPropagation(); showInChat(item); }}
+    >💬</button>
+  );
 
   const renderItem = (item: MediaItem) => {
+    const key     = itemKey(item);
     const url     = api.getMediaUrl(item.file_path || item.media_name || "");
     const isImage = item.mime_type?.startsWith("image/");
     const isVideo = item.mime_type?.startsWith("video/");
     const isAudio = item.mime_type?.startsWith("audio/") || item.mime_type === "application/ogg";
-    const failed  = failedIds.has(item.message_id);
+    const failed  = failedIds.has(key);
     const dateStr = new Date(item.timestamp).toLocaleDateString();
+    const cls     = `media-item${focusedKey === key ? " media-item-focus" : ""}`;
 
     if (failed) {
       return (
-        <div key={item.message_id} className="media-item error" title={item.file_path || ''}>
+        <div key={key} data-media-key={key} className={`${cls} error`} title={item.file_path || ''}>
           <div className="media-error-icon">❌</div>
           <div className="media-error-details"><small>{item.media_name || "Unknown"}</small></div>
+          {chatButton(item)}
         </div>
       );
     }
 
     if (isAudio) {
       return (
-        <div key={item.message_id} className="media-item audio-item"
+        <div key={key} data-media-key={key} className={`${cls} audio-item`}
              onClick={() => setExpanded(item)} title={`${dateStr} — click to play`}>
           <div className="audio-placeholder">
             <div className="audio-icon">🎵</div>
@@ -211,46 +303,50 @@ export default function MediaGallery({ chatId }: MediaGalleryProps) {
             <div className="audio-tap-hint">▶ Tap to play</div>
           </div>
           <div className="media-overlay">{dateStr}</div>
+          {chatButton(item)}
         </div>
       );
     }
 
     if (isImage) {
       return (
-        <div key={item.message_id} className="media-item"
+        <div key={key} data-media-key={key} className={cls}
              onClick={() => setExpanded(item)} title={`${dateStr} — click to expand`}>
           <img src={url} alt={item.media_name || "Image"} loading="lazy"
-               onError={() => markFailed(item.message_id)} />
+               onError={() => markFailed(key)} />
           <div className="media-overlay">{dateStr}</div>
+          {chatButton(item)}
         </div>
       );
     }
 
     if (isVideo) {
       return (
-        <div key={item.message_id} className="media-item"
+        <div key={key} data-media-key={key} className={cls}
              onClick={() => setExpanded(item)} title={`${dateStr} — click to play`}>
-          <video src={url} preload="metadata" onError={() => markFailed(item.message_id)} />
+          <video src={url} preload="metadata" onError={() => markFailed(key)} />
           <div className="media-overlay">{dateStr}</div>
           <div className="video-play-icon">▶</div>
+          {chatButton(item)}
         </div>
       );
     }
 
     return (
-      <div key={item.message_id} className="media-item"
+      <div key={key} data-media-key={key} className={cls}
            onClick={() => setExpanded(item)} title={dateStr}>
         <div className="file-placeholder">
           <div className="file-icon">📎</div>
           <div className="file-name">{item.media_name || "File"}</div>
         </div>
         <div className="media-overlay">{dateStr}</div>
+        {chatButton(item)}
       </div>
     );
   };
 
   return (
-    <div className="media-gallery">
+    <div className="media-gallery" ref={galleryRef}>
       {/* Filter tabs */}
       <div className="media-filters">
         {(["all", "images", "videos", "audios"] as const).map(f => (
@@ -260,6 +356,8 @@ export default function MediaGallery({ chatId }: MediaGalleryProps) {
           </button>
         ))}
       </div>
+
+      {notice && <div className="gallery-notice">{notice}</div>}
 
       {isLoading && <div className="loading-state">Loading media…</div>}
       {error && <div className="error-state"><p>{error}</p><button onClick={() => setFilter(filter)}>Retry</button></div>}
@@ -274,28 +372,16 @@ export default function MediaGallery({ chatId }: MediaGalleryProps) {
         </div>
       ))}
 
-      {/* Expanded modal */}
+      {/* Full-screen viewer (shared with the chat). ← / → step through the grid order. */}
       {expanded && (
-        <div className="media-modal" onClick={() => setExpanded(null)}>
-          {(expanded.mime_type?.startsWith("audio/") || expanded.mime_type === "application/ogg") ? (
-            <GalleryAudioPlayer item={expanded} />
-          ) : expanded.mime_type?.startsWith("image/") ? (
-            <div className="media-modal-inner" onClick={e => e.stopPropagation()}>
-              <img src={api.getMediaUrl(expanded.file_path || expanded.media_name || "")}
-                   alt={expanded.media_name || "Image"} />
-              {expanded.caption && <p className="modal-caption">{expanded.caption}</p>}
-            </div>
-          ) : expanded.mime_type?.startsWith("video/") ? (
-            <div className="media-modal-inner" onClick={e => e.stopPropagation()}>
-              <video controls autoPlay className="modal-video">
-                <source src={api.getMediaUrl(expanded.file_path || expanded.media_name || "")}
-                        type={expanded.mime_type} />
-              </video>
-              {expanded.caption && <p className="modal-caption">{expanded.caption}</p>}
-            </div>
-          ) : null}
-          <button className="close-modal" onClick={() => setExpanded(null)}>✕ Close</button>
-        </div>
+        <MediaViewer
+          item={expanded}
+          items={navItems}
+          onNavigate={openNeighbor}
+          onClose={() => setExpanded(null)}
+          actions={onShowInChat ? [{ label: "💬 Show in chat", accent: true, onClick: () => showInChat(expanded) }] : []}
+          renderAudio={item => <GalleryAudioPlayer key={itemKey(item)} item={item} />}
+        />
       )}
     </div>
   );

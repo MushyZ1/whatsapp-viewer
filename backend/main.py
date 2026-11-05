@@ -111,6 +111,7 @@ def _imported_msg_to_message(msg: dict) -> Message:
         message_type=msg.get('message_type', 0),
         quoted_text=msg.get('quoted_text'),
         quoted_key_id=msg.get('quoted_key_id'),
+        quoted_message_id=msg.get('quoted_message_id'),
         media=[
             MediaItem(
                 file_path=m.get('file_path'),
@@ -121,6 +122,20 @@ def _imported_msg_to_message(msg: dict) -> Message:
             for m in (msg.get('media') or [])
         ],
     )
+
+def _drop_dangling_quote_refs(data: dict) -> None:
+    """Clear quoted_message_id values that don't point at a message in this file
+    (hand-edited or trimmed exports), so the UI never offers a jump that can't work."""
+    messages = data.get('messages') or []
+    def _is_id(v) -> bool:
+        return isinstance(v, int) and not isinstance(v, bool)
+    ids = {m.get('id') for m in messages if isinstance(m, dict) and _is_id(m.get('id'))}
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        q = m.get('quoted_message_id')
+        if not (_is_id(q) and q in ids):
+            m['quoted_message_id'] = None
 
 def check_wadecrypt_installed() -> bool:
     """Check if wa-crypt-tools is installed"""
@@ -293,6 +308,7 @@ async def initialize_database(request: InitRequest):
             str(validated_media_path) if validated_media_path else None,
         )
         await db_manager.init()
+        db_manager.start_search_index()
         imported_chat_cache = None
         imported_media_path = None
         logger.info("Database initialized successfully")
@@ -303,6 +319,11 @@ async def initialize_database(request: InitRequest):
     except Exception as e:
         logger.error(f"Initialization failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/search/index-status")
+async def search_index_status():
+    fts = getattr(db_manager, "fts", None) if db_manager else None
+    return fts.status() if fts else {"state": "none", "indexed_messages": 0, "error": None}
 
 # ─── IMPORT (.wachat file) ────────────────────────────────────────────────────
 @app.post("/api/import")
@@ -327,6 +348,7 @@ async def import_chat(request: ImportChatRequest):
             detail="Invalid .wachat file — 'messages' key missing."
         )
 
+    _drop_dangling_quote_refs(data)
     imported_chat_cache = data
     db_manager = None
     imported_media_path = None
@@ -439,7 +461,7 @@ async def get_messages(
                               prev_cursor=None, total_count=total_count)
         message_ids = [msg['_id'] for msg in messages]
         media_dict  = await db_manager.get_media_for_messages(message_ids)
-        quotes_dict = await db_manager.get_quoted_messages(message_ids)
+        quotes_dict = await db_manager.get_quoted_messages(message_ids, chat_id)
         result = []
         for msg in messages:
             mid = msg['_id']
@@ -448,6 +470,7 @@ async def get_messages(
                 id=mid, timestamp=msg['timestamp'], from_me=bool(msg['from_me']),
                 text=msg.get('text_data'), message_type=msg['message_type'],
                 quoted_text=qt.get('text'), quoted_key_id=qt.get('key_id'),
+                quoted_message_id=qt.get('message_id'),
                 media=[
                     MediaItem(file_path=m.get('file_path'), media_name=m.get('media_name'),
                               mime_type=m.get('mime_type'), caption=m.get('media_caption'))
@@ -461,6 +484,46 @@ async def get_messages(
         raise
     except Exception as e:
         logger.error(f"Failed to get messages: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ─── SINGLE MESSAGE ───────────────────────────────────────────────────────────
+# Used by the media gallery's "Show in chat" button: it only knows the message id,
+# and jumping to a message needs the full message (text, media, quote).
+@app.get("/api/chats/{chat_id}/messages/{message_id}")
+async def get_message(chat_id: int, message_id: int) -> Message:
+    if chat_id == IMPORTED_CHAT_ID and imported_chat_cache is not None:
+        for m in imported_chat_cache.get('messages', []):
+            if m.get('id') == message_id:
+                return _imported_msg_to_message(m)
+        raise HTTPException(status_code=404, detail="Message not found")
+
+    if not db_manager:
+        raise HTTPException(status_code=400, detail="Database not initialized")
+    if chat_id < 0:
+        raise HTTPException(status_code=400, detail="Invalid chat_id")
+    try:
+        msg = await db_manager.get_message_by_id(message_id)
+        # also checks the message belongs to this chat
+        if not msg or msg.get('chat_row_id') != chat_id:
+            raise HTTPException(status_code=404, detail="Message not found")
+        media_dict  = await db_manager.get_media_for_messages([message_id])
+        quotes_dict = await db_manager.get_quoted_messages([message_id], chat_id)
+        qt = quotes_dict.get(message_id, {})
+        return Message(
+            id=message_id, timestamp=msg['timestamp'], from_me=bool(msg['from_me']),
+            text=msg.get('text_data'), message_type=msg['message_type'],
+            quoted_text=qt.get('text'), quoted_key_id=qt.get('key_id'),
+            quoted_message_id=qt.get('message_id'),
+            media=[
+                MediaItem(file_path=m.get('file_path'), media_name=m.get('media_name'),
+                          mime_type=m.get('mime_type'), caption=m.get('media_caption'))
+                for m in media_dict.get(message_id, [])
+            ],
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get message {message_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 # ─── SEARCH ───────────────────────────────────────────────────────────────────
@@ -514,7 +577,7 @@ async def search_messages(chat_id: int, params: SearchParams):
             params.limit, params.offset, params.sort)
         message_ids = [msg['_id'] for msg in messages]
         media_dict  = await db_manager.get_media_for_messages(message_ids)
-        quotes_dict = await db_manager.get_quoted_messages(message_ids)
+        quotes_dict = await db_manager.get_quoted_messages(message_ids, chat_id)
         result = []
         for msg in messages:
             mid = msg['_id']
@@ -523,6 +586,7 @@ async def search_messages(chat_id: int, params: SearchParams):
                 id=mid, timestamp=msg['timestamp'], from_me=bool(msg['from_me']),
                 text=msg.get('text_data'), message_type=msg['message_type'],
                 quoted_text=qt.get('text'), quoted_key_id=qt.get('key_id'),
+                quoted_message_id=qt.get('message_id'),
                 media=[
                     MediaItem(file_path=m.get('file_path'), media_name=m.get('media_name'),
                               mime_type=m.get('mime_type'), caption=m.get('media_caption'))

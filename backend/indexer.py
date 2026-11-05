@@ -31,6 +31,10 @@ async def create_indexes(db_path: str):
         # Index for quoted messages
         ("idx_quoted_message", 
          "CREATE INDEX IF NOT EXISTS idx_quoted_message ON message_quoted(message_row_id)"),
+
+        # Reply -> original message: quoted rows only store the original's key_id
+        ("idx_message_key_id",
+         "CREATE INDEX IF NOT EXISTS idx_message_key_id ON message(key_id)"),
     ]
     
     async with aiosqlite.connect(db_path) as db:
@@ -42,31 +46,8 @@ async def create_indexes(db_path: str):
                 logger.warning(f"✗ Index {name} failed: {e}")
         
         await db.commit()
-        
-        # Create FTS5 virtual table for full-text search
-        try:
-            await db.execute("""
-                CREATE VIRTUAL TABLE IF NOT EXISTS message_fts 
-                USING fts5(text_data, content=message, content_rowid=_id)
-            """)
-            
-            # Populate FTS table if empty
-            cursor = await db.execute("SELECT COUNT(*) FROM message_fts")
-            count = (await cursor.fetchone())[0]
-            
-            if count == 0:
-                logger.info("Populating FTS index (this may take a minute)...")
-                await db.execute("""
-                    INSERT INTO message_fts(rowid, text_data)
-                    SELECT _id, text_data FROM message WHERE text_data IS NOT NULL
-                """)
-                logger.info("✓ FTS index populated")
-            
-            await db.commit()
-            logger.info("✓ Full-text search ready")
-            
-        except Exception as e:
-            logger.warning(f"✗ FTS setup failed: {e}")
+
+    # Full-text search: see fts_index.py (separate file; the user's database is not modified for it)
 
 async def analyze_database(db_path: str):
     """Run ANALYZE to update query planner statistics"""

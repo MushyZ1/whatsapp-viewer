@@ -13,6 +13,9 @@ interface MessageListProps {
   hasMoreDown: boolean;
   highlightedMessageId?: number | null;
   jumpNonce?: number;
+  onViewInGallery?: (message: Message, mediaIndex: number) => void;
+  onOpenMedia?: (message: Message, mediaIndex: number) => void;
+  onJumpToQuoted?: (messageId: number) => void;
 }
 
 export default function MessageList({
@@ -25,6 +28,9 @@ export default function MessageList({
   hasMoreDown,
   highlightedMessageId,
   jumpNonce,
+  onViewInGallery,
+  onOpenMedia,
+  onJumpToQuoted,
 }: MessageListProps) {
   const parentRef = useRef<HTMLDivElement>(null);
   // Last jump we already scrolled to. Starts at the current value so that
@@ -185,7 +191,7 @@ export default function MessageList({
                 }}
                 className={isHighlighted ? "highlighted-message" : ""}
               >
-                <MessageBubble message={message} />
+                <MessageBubble message={message} onViewInGallery={onViewInGallery} onOpenMedia={onOpenMedia} onJumpToQuoted={onJumpToQuoted} />
               </div>
             );
           })}

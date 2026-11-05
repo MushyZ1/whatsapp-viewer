@@ -136,6 +136,26 @@ export function useMessages(chatId: number | null) {
     [chatId]
   );
 
+  // Jump to a message when only its id is known (e.g. from the media gallery).
+  // isLoading is set synchronously, before the first await, so the message list
+  // that is about to mount (coming back from the gallery) can't start loading
+  // older messages and disturb the jump.
+  const jumpToMessageById = useCallback(
+    async (messageId: number) => {
+      if (!chatId) return;
+      setIsLoading(true);
+      try {
+        const target = await api.getMessage(chatId, messageId);
+        await jumpToMessage(target);
+      } catch (error) {
+        console.error("Jump to message by id failed:", error);
+        alert(`Could not open that message: ${error}`);
+        setIsLoading(false);
+      }
+    },
+    [chatId, jumpToMessage]
+  );
+
   // NEW: Jump to oldest message (INSTANT - no incremental loading!)
   const jumpToTop = useCallback(async () => {
     if (!chatId || isLoading) return;
@@ -214,6 +234,7 @@ export function useMessages(chatId: number | null) {
     totalCount,
     highlightedMessageId,
     jumpToMessage,
+    jumpToMessageById,
     jumpToTop,
     jumpToBottom,
     jumpNonce,

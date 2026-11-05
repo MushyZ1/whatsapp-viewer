@@ -41,6 +41,17 @@ Worse, people lose years of irreplaceable conversations every time they change p
 
 ---
 
+## What's new in v2.0.0
+
+- **Gallery ↔ chat navigation** — open any media in the gallery from the chat (🖼 button or the viewer's *View in gallery*), and jump from the gallery back to the message with *Show in chat*.
+- **Better media viewer** — full-screen viewer with a toolbar, ‹ › buttons, a position counter and ← / → / Esc keys, in both the gallery and the chat. In the chat it steps through the chat's images and videos; closing it takes you to the message you stopped on.
+- **Remembers your media folder** — per database / `.wachat` file, so you don't re-pick it every launch.
+- **Click a reply to jump** — clicking a quoted message scrolls to the original, even from search results.
+- **System, deleted and sticker messages** — shown properly (group events, "This message was deleted", stickers without a bubble) instead of blank bubbles. `tools/msgtype_diagnostic.py` lists which message types your database uses.
+- **Faster search** — an FTS5 (trigram) index, built in the background in the app-data folder (your database is never modified). Results are the same as before; search falls back to the old method if the index isn't ready.
+
+---
+
 ## How Decryption Works
 
 WhatsApp stores your Android backup as an encrypted SQLite database at:
@@ -175,7 +186,7 @@ Send the `.wachat` file or `.zip` to anyone. On their machine:
 │  Binds to 127.0.0.1:8765 only          │
 │  • Decryption via wadecrypt CLI         │
 │  • SQLite queries (aiosqlite)           │
-│  • Full-text search (FTS5)             │
+│  • FTS5 (trigram) search index         │
 │  • Media file serving                   │
 │  • ZIP export with live SSE progress    │
 └────────────────┬────────────────────────┘
@@ -255,12 +266,7 @@ Installers land in `src-tauri/target/release/bundle/`.
 
 ### Automated builds (GitHub Actions)
 
-Tag a release and GitHub builds for all three platforms automatically:
-
-```bash
-git tag v0.1.0
-git push origin v0.1.0
-```
+Push to `main`, then on GitHub open **Actions → Build & Release → Run workflow** and enter a tag such as `v2.0.0`. GitHub builds for Windows, macOS (Intel and Apple Silicon) and Linux and attaches the installers to the release.
 
 ---
 

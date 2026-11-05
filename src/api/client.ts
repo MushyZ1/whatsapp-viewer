@@ -24,6 +24,8 @@ export interface Message {
   message_type: number;
   quoted_text?: string | null;
   quoted_key_id?: string | null;
+  /** _id of the message this one replies to (null if it can't be found): the quote can jump there */
+  quoted_message_id?: number | null;
   media: MediaItem[];
 }
 
@@ -141,6 +143,12 @@ export const api = {
     if (cursor) params.append("cursor", cursor.toString());
     const res = await fetchWithTimeout(`${API_BASE}/chats/${chatId}/messages?${params}`);
     if (!res.ok) throw new Error(`Fetch messages failed: ${await res.text()}`);
+    return res.json();
+  },
+
+  async getMessage(chatId: number, messageId: number): Promise<Message> {
+    const res = await fetchWithTimeout(`${API_BASE}/chats/${chatId}/messages/${messageId}`);
+    if (!res.ok) throw new Error(`Fetch message failed: ${await res.text()}`);
     return res.json();
   },
 

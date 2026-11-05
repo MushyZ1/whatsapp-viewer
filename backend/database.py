@@ -2,6 +2,7 @@ import aiosqlite
 from typing import List, Optional, Tuple, Dict
 from datetime import datetime, timedelta
 from search_utils import parse_query, matches, score, matches_blob, score_blob
+from fts_index import FtsIndex
 import logging
 from pathlib import Path
 import json
@@ -9,12 +10,28 @@ import re
 
 logger = logging.getLogger(__name__)
 
+
+class _FtsFallback(Exception):
+    """The FTS-narrowed query failed: retry without the index."""
+
 class DatabaseManager:
     def __init__(self, db_path: str, media_path: Optional[str] = None):
         self.db_path = db_path
         self.media_path = Path(media_path) if media_path else None
         self.schema_cache = {}
         self._connection = None
+        self.fts: Optional[FtsIndex] = None
+    
+    def start_search_index(self):
+        """Build/reuse the FTS5 candidate index in the background (never blocks, never raises)."""
+        self.close_search_index()
+        self.fts = FtsIndex(self.db_path)
+        self.fts.start()
+
+    def close_search_index(self):
+        if self.fts is not None:
+            self.fts.cancel()
+            self.fts = None
     
     async def init(self):
         """Initialize database connection and detect schema"""
@@ -29,6 +46,7 @@ class DatabaseManager:
             cursor = await db.execute("PRAGMA table_info(message)")
             cols = await cursor.fetchall()
             self.schema_cache['message_columns'] = [row[1] for row in cols]
+            self.schema_cache['has_message_key_id'] = 'key_id' in self.schema_cache['message_columns']
             
             if 'from_me' in self.schema_cache['message_columns']:
                 self.schema_cache['from_me_col'] = 'from_me'
@@ -286,8 +304,13 @@ class DatabaseManager:
             logger.info(f"✅ Loaded media for {len(message_ids)} messages in {(len(message_ids) + BATCH_SIZE - 1) // BATCH_SIZE} batches")
             return result
     
-    async def get_quoted_messages(self, message_ids: List[int]) -> dict:
-        """Get quoted/reply data for messages"""
+    async def get_quoted_messages(self, message_ids: List[int], chat_id: Optional[int] = None) -> dict:
+        """Get quoted/reply data for messages.
+
+        Each entry has 'text', 'key_id' and 'message_id': the _id of the original message
+        (None when it can't be found). With chat_id only an original in that chat counts,
+        since the UI can only jump inside the open chat.
+        """
         if not message_ids:
             return {}
         
@@ -320,8 +343,38 @@ class DatabaseManager:
                 except Exception as e:
                     logger.warning(f"Failed to get quoted messages for batch: {e}")
                     continue
+
+            for entry in result.values():
+                entry['message_id'] = None
+            try:
+                resolved = await self._resolve_key_ids(
+                    db, sorted({e['key_id'] for e in result.values() if e.get('key_id')}), chat_id)
+            except Exception as e:
+                # a failed lookup must never break loading messages: replies just aren't clickable
+                logger.warning(f"Could not resolve quoted messages: {e}")
+                resolved = {}
+            for entry in result.values():
+                entry['message_id'] = resolved.get(entry.get('key_id'))
             
             return result
+
+    async def _resolve_key_ids(self, db, key_ids: List[str], chat_id: Optional[int]) -> Dict[str, int]:
+        """Map WhatsApp key_id strings to message _ids (see get_quoted_messages)."""
+        if not key_ids or not self.schema_cache.get('has_message_key_id'):
+            return {}
+        BATCH_SIZE = 900
+        found: Dict[str, int] = {}
+        for i in range(0, len(key_ids), BATCH_SIZE):
+            batch = key_ids[i:i + BATCH_SIZE]
+            placeholders = ','.join('?' * len(batch))
+            cursor = await db.execute(
+                f"SELECT _id, key_id, chat_row_id FROM message WHERE key_id IN ({placeholders})",
+                tuple(batch))
+            for row in await cursor.fetchall():
+                if chat_id is not None and row['chat_row_id'] != chat_id:
+                    continue
+                found.setdefault(row['key_id'], row['_id'])
+        return found
     
     def _prepare_search_query(self, query: str) -> str:
         """
@@ -346,7 +399,18 @@ class DatabaseManager:
             # Multiple words: match as phrase
             return f"%{query}%"
     
-    async def search_messages(
+    async def search_messages(self, *args, **kwargs) -> Tuple[List[dict], int]:
+        """
+        Search messages with WhatsApp-style matching (partial words, phrases, case-insensitive).
+        The FTS5 index only narrows the candidates; if anything about it fails, the plain scan runs.
+        """
+        try:
+            return await self._search_messages_impl(*args, use_fts=True, **kwargs)
+        except _FtsFallback:
+            logger.warning("Search index query failed; using plain search")
+            return await self._search_messages_impl(*args, use_fts=False, **kwargs)
+
+    async def _search_messages_impl(
         self,
         chat_id: int,
         query: Optional[str] = None,
@@ -354,14 +418,9 @@ class DatabaseManager:
         date_to: Optional[str] = None,
         limit: int = 100,
         offset: int = 0,
-        sort: str = "time"
+        sort: str = "time",
+        use_fts: bool = True,
     ) -> Tuple[List[dict], int]:
-        """
-        Search messages with WhatsApp-style matching:
-        - Partial word matching
-        - Phrase matching
-        - Case insensitive
-        """
         from_me_col = self._get_from_me_col()
         limit = min(max(1, limit), 500)
         offset = max(0, offset)
@@ -395,7 +454,18 @@ class DatabaseManager:
                 WHERE chat_row_id = ? AND wa_match(text_data, {media_expr}) = ?
                 """
                 params = [chat_id, 1]
+                narrowed = None
+                nar = self.fts.narrowing(pq) if (use_fts and self.fts is not None) else None
+                if nar:
+                    try:
+                        await db.execute("ATTACH DATABASE ? AS ftsdb", (nar[0],))
+                        base_query += " AND _id IN (SELECT rowid FROM ftsdb.msgfts WHERE msgfts MATCH ?)"
+                        params.append(nar[1])
+                        narrowed = True
+                    except Exception as e:
+                        logger.warning(f"Search index not attached: {e}")
             else:
+                narrowed = None
                 base_query = f"""
                 SELECT _id, timestamp, {from_me_col} as from_me,
                        text_data, message_type
@@ -435,6 +505,8 @@ class DatabaseManager:
                 
                 logger.info(f"âœ… Search found {total_count} total matches")
             except Exception as e:
+                if narrowed:
+                    raise _FtsFallback()
                 logger.error(f"Count query failed: {e}")
                 total_count = 0
             
@@ -448,6 +520,8 @@ class DatabaseManager:
                 cursor = await db.execute(base_query, tuple(params))
                 messages = [dict(row) for row in await cursor.fetchall()]
             except Exception as e:
+                if narrowed:
+                    raise _FtsFallback()
                 logger.error(f"Search query failed: {e}")
                 messages = []
             
@@ -591,7 +665,7 @@ class DatabaseManager:
             
             message_ids = [msg['_id'] for msg in messages]
             media_dict = await self.get_media_for_messages(message_ids)
-            quotes_dict = await self.get_quoted_messages(message_ids)
+            quotes_dict = await self.get_quoted_messages(message_ids, chat_id)
             
             export_data = {
                 'version': '1.0',
@@ -612,7 +686,8 @@ class DatabaseManager:
                     'message_type': msg['message_type'],
                     'media': media_dict.get(msg_id, []),
                     'quoted_text': quotes_dict.get(msg_id, {}).get('text'),
-                    'quoted_key_id': quotes_dict.get(msg_id, {}).get('key_id')
+                    'quoted_key_id': quotes_dict.get(msg_id, {}).get('key_id'),
+                    'quoted_message_id': quotes_dict.get(msg_id, {}).get('message_id')
                 }
                 export_data['messages'].append(export_msg)
             

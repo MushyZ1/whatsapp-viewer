@@ -1,10 +1,16 @@
 import { useState, useRef, useEffect, useCallback } from "react";
-import { createPortal } from "react-dom";
 import { Message, api } from "../api/client";
+import { getMessageKind, systemText, deletedText, unsupportedText } from "../utils/messageKind";
 
 interface MessageBubbleProps {
   message: Message;
   highlightTerms?: string[];
+  /** "View in gallery": open attachment number `mediaIndex` of this message in the media gallery. */
+  onViewInGallery?: (message: Message, mediaIndex: number) => void;
+  /** Click on an image / video: open it in the full-screen viewer (which can step through the chat's media). */
+  onOpenMedia?: (message: Message, mediaIndex: number) => void;
+  /** Clicking a reply's quote: jump to the message it replies to. */
+  onJumpToQuoted?: (messageId: number) => void;
 }
 
 // ─── WHATSAPP-STYLE AUDIO PLAYER ────────────────────────────────────────────
@@ -207,25 +213,8 @@ function highlightText(text: string, terms?: string[]): React.ReactNode {
   return out;
 }
 
-// Draws its children on top of the whole window (outside the transformed, clipped
-// message rows) and closes on Esc. Clicks inside never reach the message/search row.
-function ModalPortal({ onClose, children }: { onClose: () => void; children: React.ReactNode }) {
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") { e.stopPropagation(); onClose(); }
-    };
-    window.addEventListener("keydown", onKey, true);
-    return () => window.removeEventListener("keydown", onKey, true);
-  }, [onClose]);
-  return createPortal(
-    <div onClick={e => e.stopPropagation()}>{children}</div>,
-    document.body,
-  );
-}
-
-export default function MessageBubble({ message, highlightTerms }: MessageBubbleProps) {
+export default function MessageBubble({ message, highlightTerms, onViewInGallery, onOpenMedia, onJumpToQuoted }: MessageBubbleProps) {
   const [isMediaVisible, setIsMediaVisible]   = useState(false);
-  const [expandedIdx, setExpandedIdx]         = useState<number | null>(null);
   const [errorIdx, setErrorIdx]               = useState<number | null>(null);
   const [failedSet, setFailedSet]             = useState<Set<number>>(new Set());
   const mediaRef = useRef<HTMLDivElement>(null);
@@ -251,11 +240,25 @@ export default function MessageBubble({ message, highlightTerms }: MessageBubble
 
   const fmtFull = (ts: number) => new Date(ts).toLocaleString();
 
+  // the original message this reply points at (only clickable when we know where it is)
+  const quotedTarget = onJumpToQuoted ? message.quoted_message_id ?? null : null;
+  const jumpToQuoted = (messageId: number) => onJumpToQuoted?.(messageId);
+
+  const viewInGallery = (idx: number) => onViewInGallery?.(message, idx);
+
+  // small 🖼 button on the attachment (visible on hover)
+  const galleryButton = (idx: number) => onViewInGallery && (
+    <button
+      className="media-gallery-btn"
+      title="View in gallery"
+      onClick={e => { e.stopPropagation(); viewInGallery(idx); }}
+    >🖼</button>
+  );
+
   const renderMedia = (media: any, idx: number) => {
     const path    = media.file_path || media.media_name || "";
     const url     = api.getMediaUrl(path);
     const failed  = failedSet.has(idx);
-    const expanded = expandedIdx === idx;
 
     if (!isMediaVisible) {
       const icon = media.mime_type?.startsWith("image/") ? "🖼️"
@@ -275,41 +278,35 @@ export default function MessageBubble({ message, highlightTerms }: MessageBubble
 
     if (media.mime_type?.startsWith("audio/")) {
       return (
-        <InlineAudioPlayer
-          key={idx}
-          src={url}
-          mimeType={media.mime_type}
-          caption={media.caption}
-          messageId={message.id}
-          mediaPath={path}
-          onError={() => markFailed(idx)}
-        />
+        <div key={idx} className="media-with-actions">
+          <InlineAudioPlayer
+            src={url}
+            mimeType={media.mime_type}
+            caption={media.caption}
+            messageId={message.id}
+            mediaPath={path}
+            onError={() => markFailed(idx)}
+          />
+          {galleryButton(idx)}
+        </div>
       );
     }
 
     if (media.mime_type?.startsWith("image/")) {
       return (
         <span key={idx}>
-          <img
-            src={url}
-            alt={media.media_name || "Image"}
-            className="message-image"
-            loading="lazy"
-            onClick={(e) => { e.stopPropagation(); setExpandedIdx(expanded ? null : idx); }}
-            onError={() => markFailed(idx)}
-            title="Click to expand"
-          />
-          {expanded && (
-            <ModalPortal onClose={() => setExpandedIdx(null)}>
-              <div className="media-modal" onClick={() => setExpandedIdx(null)}>
-                <div className="media-modal-inner" onClick={e => e.stopPropagation()}>
-                  <img src={url} alt={media.media_name || "Image"} />
-                  {media.caption && <p className="modal-caption">{media.caption}</p>}
-                </div>
-                <button className="close-modal" onClick={() => setExpandedIdx(null)}>✕ Close</button>
-              </div>
-            </ModalPortal>
-          )}
+          <div className="media-with-actions">
+            <img
+              src={url}
+              alt={media.media_name || "Image"}
+              className="message-image"
+              loading="lazy"
+              onClick={(e) => { e.stopPropagation(); onOpenMedia?.(message, idx); }}
+              onError={() => markFailed(idx)}
+              title="Click to expand"
+            />
+            {galleryButton(idx)}
+          </div>
         </span>
       );
     }
@@ -317,27 +314,17 @@ export default function MessageBubble({ message, highlightTerms }: MessageBubble
     if (media.mime_type?.startsWith("video/")) {
       return (
         <span key={idx}>
-          <div className="video-thumb-wrapper" onClick={(e) => { e.stopPropagation(); setExpandedIdx(expanded ? null : idx); }} title="Click to play">
-            <video className="message-video" preload="metadata"
-              onError={() => markFailed(idx)}
-            >
-              <source src={url} type={media.mime_type} />
-            </video>
-            <div className="video-play-overlay">▶</div>
+          <div className="media-with-actions">
+            <div className="video-thumb-wrapper" onClick={(e) => { e.stopPropagation(); onOpenMedia?.(message, idx); }} title="Click to play">
+              <video className="message-video" preload="metadata"
+                onError={() => markFailed(idx)}
+              >
+                <source src={url} type={media.mime_type} />
+              </video>
+              <div className="video-play-overlay">▶</div>
+            </div>
+            {galleryButton(idx)}
           </div>
-          {expanded && (
-            <ModalPortal onClose={() => setExpandedIdx(null)}>
-              <div className="media-modal" onClick={() => setExpandedIdx(null)}>
-                <div className="media-modal-inner" onClick={e => e.stopPropagation()}>
-                  <video controls autoPlay className="modal-video">
-                    <source src={url} type={media.mime_type} />
-                  </video>
-                  {media.caption && <p className="modal-caption">{media.caption}</p>}
-                </div>
-                <button className="close-modal" onClick={() => setExpandedIdx(null)}>✕ Close</button>
-              </div>
-            </ModalPortal>
-          )}
         </span>
       );
     }
@@ -349,18 +336,46 @@ export default function MessageBubble({ message, highlightTerms }: MessageBubble
     );
   };
 
+  const kind = getMessageKind(message);
+  if (kind === "system" || kind === "deleted" || kind === "unsupported") {
+    const label = kind === "system" ? systemText(message) : kind === "deleted" ? deletedText(message) : unsupportedText(message);
+    return (
+      <div className="message-notice-row">
+        <div className={`message-notice message-notice-${kind}`} title={fmtFull(message.timestamp)}>
+          {kind === "deleted" && <span className="message-notice-icon">🚫</span>}
+          {kind === "system"
+            ? highlightText(label, highlightTerms)
+            : label}
+          <span className="message-notice-time">{fmtTime(message.timestamp)}</span>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <>
       {/* Outer wrapper: full width, used to push bubble left or right */}
       <div style={{ display: 'flex', justifyContent: message.from_me ? 'flex-end' : 'flex-start', padding: '1px 0' }}>
         <div
-          className={`message-bubble ${message.from_me ? "sent" : "received"}`}
+          className={`message-bubble ${message.from_me ? "sent" : "received"}${kind === "sticker" ? " message-bubble-sticker" : ""}`}
           title={fmtFull(message.timestamp)}
         >
-          {message.quoted_text && (
-            <div className="quoted-message">
+          {(message.quoted_text || message.quoted_message_id != null) && (
+            <div
+              className={`quoted-message${quotedTarget != null ? " quoted-clickable" : ""}`}
+              {...(quotedTarget != null ? {
+                role: "button",
+                tabIndex: 0,
+                title: "Jump to the original message",
+                onClick: (e: React.MouseEvent) => { e.stopPropagation(); jumpToQuoted(quotedTarget); },
+                onKeyDown: (e: React.KeyboardEvent) => {
+                  if (e.key === "Enter" || e.key === " ") { e.preventDefault(); e.stopPropagation(); jumpToQuoted(quotedTarget); }
+                },
+              } : {})}
+            >
               <div className="quoted-bar" />
-              <div className="quoted-text">{message.quoted_text}</div>
+              {/* replies to attachments have no quoted text: still show something to click */}
+              <div className="quoted-text">{message.quoted_text || "Original message"}</div>
             </div>
           )}
 

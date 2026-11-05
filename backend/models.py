@@ -10,6 +10,9 @@ class Message(BaseModel):
     message_type: int
     quoted_text: Optional[str] = None
     quoted_key_id: Optional[str] = None
+    # _id of the message this one replies to (None if it can't be found in this chat);
+    # lets the UI jump to the original when the quote is clicked
+    quoted_message_id: Optional[int] = None
     media: List['MediaItem'] = []
 
 class MediaItem(BaseModel):
